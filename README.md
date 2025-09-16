@@ -217,5 +217,4 @@ python scraperGoat.py --url "https://example.com/product" --out test.csv
 - Excel/CSV input/output support
 - Comprehensive error handling
 - Documentation and examples
-#   E - C o m m e r c e - W e b - S c r a p e r s - C o l l e c t i o n  
- 
+#
