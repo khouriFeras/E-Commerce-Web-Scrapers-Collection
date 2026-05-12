@@ -37,6 +37,18 @@ def clean_ws(s: str) -> str:
     s = re.sub(r"\s+", " ", s or "").strip()
     return s
 
+def norm_sku(s: str) -> str:
+    """
+    Normalize SKU/model strings for comparison.
+    - Uppercase
+    - Remove whitespace and common separators
+    - Keep only A-Z0-9 to be resilient to formatting like "ABC-123" vs "ABC 123"
+    """
+    s = (s or "").strip().upper()
+    s = re.sub(r"\s+", "", s)
+    s = re.sub(r"[^A-Z0-9]+", "", s)
+    return s
+
 def absolutize(url: str, base: str) -> str:
     if not url:
         return ""
@@ -388,6 +400,34 @@ def get_product_title(driver) -> str:
     except Exception:
         return ""
 
+def get_product_sku_number(driver) -> str:
+    """
+    Extract product SKU/model number from theme element:
+      class="product-meta__sku-number"
+    Returns cleaned string (may be empty).
+    """
+    try:
+        # Wait briefly for the SKU element to appear (some themes load it after paint).
+        try:
+            wait(driver, 3).until(EC.presence_of_element_located((By.CSS_SELECTOR, ".product-meta__sku-number")))
+        except Exception:
+            pass
+
+        els = driver.find_elements(By.CSS_SELECTOR, ".product-meta__sku-number")
+        for el in els[:3]:
+            # Try visible text first
+            txt = clean_ws(el.text or "")
+            if txt:
+                return txt
+            # Fallbacks: sometimes SKU is injected as attribute content
+            for attr in ("content", "data-sku", "data-value", "value", "aria-label"):
+                v = clean_ws(el.get_attribute(attr) or "")
+                if v:
+                    return v
+        return ""
+    except Exception:
+        return ""
+
 
 def get_price(driver) -> str:
     """
@@ -421,6 +461,7 @@ def scrape_one(driver, sku: str, pause: float, captcha_wait_sec: int = 0, wait_f
     result = {
         "SKU": sku,
         "Product_URL": "",
+        "Website_SKU": "",
         "Title": "",
         "Price": "",
         "Image Src": "",
@@ -435,16 +476,93 @@ def scrape_one(driver, sku: str, pause: float, captcha_wait_sec: int = 0, wait_f
         if not ok:
             return result
 
+        # Keep a handle to the search results page so we can try multiple candidates.
+        search_url = driver.current_url
+
         if wait_for_enter:
             input("Solve the CAPTCHA in the browser, then press Enter here to continue...")
         elif captcha_wait_sec > 0:
             time.sleep(captcha_wait_sec)
 
-        if not open_first_product_from_results(driver, pause):
+        # Collect candidate product URLs from the search results (and/or current page).
+        candidate_urls: list[str] = []
+
+        # If we already landed on a product page, treat it as first candidate.
+        cur = driver.current_url
+        if re.search(r"/products?/", cur):
+            candidate_urls.append(cur)
+
+        # If we are on a search results page, collect ONLY product-card links (avoid menu/footer noise).
+        if not re.search(r"/products?/", cur):
+            try:
+                card_selectors = [
+                    'a[href*="/products/"].product-item__image-wrapper',
+                    'a[href*="/products/"].full-unstyled-link',
+                    'a[href*="/products/"].product-item__title',
+                    'a.card-wrapper[href*="/products/"]',
+                ]
+                links = []
+                for sel in card_selectors:
+                    links.extend(driver.find_elements(By.CSS_SELECTOR, sel))
+                if not links:
+                    # fallback: still restrict to anchors likely inside results grid
+                    links = driver.find_elements(By.CSS_SELECTOR, "main a[href*='/products/'], #MainContent a[href*='/products/']")
+                for a in links:
+                    href = a.get_attribute("href") or ""
+                    if href and href not in candidate_urls:
+                        candidate_urls.append(href)
+            except Exception:
+                pass
+
+        # As a fallback, use the previous behavior to click the first card, then capture URL.
+        if not candidate_urls:
+            if not open_first_product_from_results(driver, pause):
+                return result
+            if driver.current_url:
+                candidate_urls.append(driver.current_url)
+
+        # Try a few candidates until we find a matching SKU on the page.
+        target = norm_sku(sku)
+        matched = False
+        tried = 0
+        MAX_CANDIDATES = 8
+        for url in candidate_urls[:MAX_CANDIDATES]:
+            tried += 1
+            try:
+                if driver.current_url != url:
+                    driver.get(url)
+                    time.sleep(pause)
+                    try:
+                        close_overlays(driver)
+                    except Exception:
+                        pass
+            except Exception:
+                continue
+
+            website_sku = get_product_sku_number(driver)
+            result["Website_SKU"] = website_sku
+            ws_norm = norm_sku(website_sku)
+
+            # Require strong match: exact normalized match, or containment when one side is a strict subset.
+            if target and ws_norm and (ws_norm == target or ws_norm in target or target in ws_norm):
+                matched = True
+                break
+
+            # If we started on a product page but it doesn't match, go back to search page once
+            # and keep trying other candidates if we have them.
+            if tried == 1 and re.search(r"/products?/", search_url) and search_url != driver.current_url:
+                # search_url itself might be product; ignore
+                pass
+
+        if not matched:
+            result["Status"] = "SKU_MISMATCH_OR_NOT_FOUND"
             return result
 
         # we are on product page now
         result["Product_URL"] = driver.current_url
+        # capture again after navigation (in case it loaded late)
+        if not result.get("Website_SKU"):
+            result["Website_SKU"] = get_product_sku_number(driver)
 
         # Title (.product-meta__title h1)
         result["Title"] = get_product_title(driver)
@@ -547,6 +665,7 @@ def main():
     # Map results by SKU
     by_sku = {r["SKU"]: r for r in results}
     merged["Product_URL"] = merged[args.sku_col].map(lambda s: by_sku.get(str(s).strip(), {}).get("Product_URL", ""))
+    merged["Website_SKU"] = merged[args.sku_col].map(lambda s: by_sku.get(str(s).strip(), {}).get("Website_SKU", ""))
     merged["Title"]       = merged[args.sku_col].map(lambda s: by_sku.get(str(s).strip(), {}).get("Title", ""))
     merged["Price"]       = merged[args.sku_col].map(lambda s: by_sku.get(str(s).strip(), {}).get("Price", ""))
     merged["Image Src"]   = merged[args.sku_col].map(lambda s: by_sku.get(str(s).strip(), {}).get("Image Src", ""))

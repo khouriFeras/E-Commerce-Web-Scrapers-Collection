@@ -389,6 +389,38 @@ def extract_description(driver) -> str:
             cleaned = " ".join(cleaned.split())
             return cleaned
 
+        # STRICT MODE (requested): only scrape the Elementor single-product-content widget body.
+        # This matches blocks like:
+        # `.wd-single-content.elementor-widget-wd_single_product_content .elementor-widget-container`
+        try:
+            soup = BeautifulSoup(driver.page_source or "", "html.parser")
+            widget = soup.select_one(
+                ".wd-single-content.elementor-widget-wd_single_product_content .elementor-widget-container"
+            )
+            if widget:
+                parts: List[str] = []
+                h3 = widget.find("h3")
+                if h3:
+                    t = _clean_desc(h3.get_text("\n", strip=True))
+                    if t:
+                        parts.append(t)
+
+                ul = widget.find("ul")
+                if ul:
+                    items: List[str] = []
+                    for li in ul.find_all("li"):
+                        t = _clean_desc(li.get_text("\n", strip=True))
+                        if t:
+                            items.append(t)
+                    if items:
+                        parts.append("\n".join(f"- {x}" for x in items))
+
+                final = "\n".join(p for p in parts if p).strip()
+                if final:
+                    return final
+        except Exception:
+            pass
+
         # Preferred: bashitihardware.com renders the real description body inside:
         # class="markdown prose w-full break-words dark:prose-invert dark"
         # The previous logic was too broad and could pull unrelated page text.
@@ -697,7 +729,7 @@ def scrape_from_sku_search(
         return {
             "QuerySKU": query_sku,
             "SearchURL": search_url,
-            "ProductURL": search_url,
+            "ProductURL": "",
             "Title": "",
             "SKU": "",
             "Price": "",
