@@ -217,4 +217,48 @@ python scraperGoat.py --url "https://example.com/product" --out test.csv
 - Excel/CSV input/output support
 - Comprehensive error handling
 - Documentation and examples
-#
+## BCI Xiaomi Smartphones Scraper
+
+This scraper collects product data from `https://jo.bcimobilestore.com/en/xiaomi/smartphones.html?product_list_limit=48` and outputs a CSV with:
+
+- SKU
+- Product title
+- Old price (before sale)
+- New price (after sale)
+- Description (key-value pairs from "More Information")
+- Per-color image URL columns (e.g., `yellowimgs`, `greenimgs`, etc.), each containing semicolon-separated URLs
+
+It ignores disabled color options and collects all images for each enabled color. If a product has no color options, images are stored under `defaultimgs`.
+
+Requirements
+- Python 3.9+
+- Windows PowerShell (as in your environment)
+
+Setup
+1) Create a virtual environment (recommended):
+```powershell
+python -m venv .venv
+. .venv\Scripts\Activate.ps1
+```
+
+2) Install dependencies:
+```powershell
+pip install -r requirements.txt
+python -m playwright install chromium
+```
+
+Run
+```powershell
+python scripts/bci_scraper.py
+```
+
+Output
+- CSV at `output/bci_xiaomi_smartphones.csv`
+- Color image columns are created dynamically based on discovered colors across products (normalized to lowercase and without spaces/dashes, with `imgs` suffix). For example: `yellowimgs`, `greenimgs`, `blackimgs`.
+- Image URLs are absolute and separated by `;`.
+
+Notes
+- Prices are extracted from Magento price containers, with fallbacks.
+- SKU is extracted from common SKU locations and falls back to the "More Information" table.
+- Description aggregates the key-value pairs from the "More Information" table.
+- The script uses headless Chromium via Playwright to render JS and click color swatches to load the correct gallery images per color.

@@ -664,17 +664,10 @@ def main():
 
         out_df = pd.DataFrame(records)
 
-        # Expand Images list into IMGURL1..N (keep at least IMGURL1 column)
-        max_imgs = max((len(x or []) for x in out_df["Images"]), default=0)
-        max_imgs = min(max_imgs, args.max_img)
-        if max_imgs == 0:
-            max_imgs = 1
+        # Convert Images list to comma-separated string
+        out_df["Images"] = out_df["Images"].apply(lambda lst: ", ".join(lst) if isinstance(lst, list) and lst else "")
 
-        for i in range(max_imgs):
-            out_df[f"IMGURL{i+1}"] = out_df["Images"].apply(lambda lst, i=i: (lst[i] if (isinstance(lst, list) and i < len(lst)) else ""))
-
-        keep_cols = ["_SKU_SCRAPE_KEY", "Found", "ProductURL", "Description", "Categories", "Brand"] + \
-                    [f"IMGURL{i+1}" for i in range(max_imgs)] + ["Note"]
+        keep_cols = ["_SKU_SCRAPE_KEY", "Found", "ProductURL", "Description", "Categories", "Brand", "Images", "Note"]
         out_df = out_df[keep_cols]
 
         merged = df.merge(out_df, on="_SKU_SCRAPE_KEY", how="left").drop(columns=["_SKU_SCRAPE_KEY"])
