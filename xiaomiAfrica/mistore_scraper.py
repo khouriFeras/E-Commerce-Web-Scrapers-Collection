@@ -19,6 +19,7 @@ Flow:
 Dependencies: pip install selenium pandas openpyxl
 """
 
+import argparse
 import time
 import re
 from pathlib import Path
@@ -36,19 +37,15 @@ from selenium.common.exceptions import TimeoutException, NoSuchElementException,
 # ============================
 # CONFIG
 # ============================
-INPUT_FILE = r"results.xlsx"
-OUTPUT_FILE = r"results.xlsx"
-SKU_COL = "SKU"
-HEADLESS = False
 SLEEP = 1.0
 TIMEOUT = 15
 BASE_URL = "https://mistore.africa/product"
 
 
-def make_driver():
+def make_driver(headful: bool = False):
     """Create and configure Chrome driver."""
     opts = Options()
-    if HEADLESS:
+    if not headful:
         opts.add_argument("--headless=new")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
@@ -346,22 +343,26 @@ def scrape_product(driver, wait: WebDriverWait, sku: str) -> Tuple[str, str, Lis
 
 
 def main():
-    """Main function."""
-    input_path = Path(INPUT_FILE)
+    ap = argparse.ArgumentParser(description="MiStore Africa scraper by SKU")
+    ap.add_argument("--in", dest="inp", required=True, help="Input Excel file")
+    ap.add_argument("--out", required=True, help="Output Excel file")
+    ap.add_argument("--sku-col", dest="sku_col", default="SKU", help="SKU column name (default: SKU)")
+    ap.add_argument("--headful", action="store_true", help="Show browser window")
+    args = ap.parse_args()
+
+    input_path = Path(args.inp)
     if not input_path.exists():
-        print(f"Error: Input file not found: {INPUT_FILE}")
+        print(f"Error: Input file not found: {args.inp}")
         return
-    
-    # Read Excel file
-    print(f"Reading SKUs from: {INPUT_FILE}")
+
+    print(f"Reading SKUs from: {args.inp}")
     df = pd.read_excel(input_path)
-    
-    if SKU_COL not in df.columns:
-        print(f"Error: Column '{SKU_COL}' not found. Available columns: {list(df.columns)}")
+
+    if args.sku_col not in df.columns:
+        print(f"Error: Column '{args.sku_col}' not found. Available columns: {list(df.columns)}")
         return
-    
-    # Initialize driver
-    driver = make_driver()
+
+    driver = make_driver(headful=args.headful)
     wait = WebDriverWait(driver, TIMEOUT)
     
     titles = []
@@ -371,7 +372,7 @@ def main():
     try:
         total = len(df)
         for idx, row in df.iterrows():
-            sku = str(row.get(SKU_COL, "")).strip()
+            sku = str(row.get(args.sku_col, "")).strip()
             
             if not sku or sku.lower() in {"nan", "none", ""}:
                 print(f"[{idx + 1}/{total}] Empty SKU, skipping")
@@ -405,10 +406,10 @@ def main():
     df["description"] = descriptions
     df["images"] = images_list
     
-    output_path = Path(OUTPUT_FILE)
+    output_path = Path(args.out)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     df.to_excel(output_path, index=False)
-    print(f"\n✓ Done! Saved to: {OUTPUT_FILE}")
+    print(f"\n✓ Done! Saved to: {args.out}")
     print(f"  Total rows processed: {total}")
     print(f"  Titles found: {sum(1 for t in titles if t)}")
     print(f"  Descriptions found: {sum(1 for d in descriptions if d)}")

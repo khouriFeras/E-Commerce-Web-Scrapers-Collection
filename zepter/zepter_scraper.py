@@ -16,6 +16,7 @@ Dependencies: pip install selenium pandas openpyxl
 (Use Selenium ≥ 4.10 so Selenium Manager auto-fetches the correct driver.)
 """
 
+import argparse
 import re, time
 from pathlib import Path
 import pandas as pd
@@ -29,15 +30,11 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, StaleElementReferenceException, WebDriverException
 
 # ============================
-# CONFIG — edit here
+# CONFIG
 # ============================
-INPUT_FILE  = r"data\Jafarshop Stock Update - Feb 6.xlsx - Sheet1 (1).xlsx"  # your Excel
-OUTPUT_FILE = r"zepter_out.xlsx"
-SKU_COL     = "Item Code"      # column that holds the SKU you want to search
-HEADLESS    = False             # set True on server; keep False now to watch it work
-SLEEP       = 0.8
-TIMEOUT     = 25
-SAVE_DEBUG  = True              # saves HTML/PNG on failures under ./debug/
+SLEEP   = 0.8
+TIMEOUT = 25
+SAVE_DEBUG = True
 # ============================
 
 HOME = "https://shop.zepter.com.jo/en-JO/"
@@ -50,9 +47,9 @@ SECTION_HEADINGS = [
 ]
 
 
-def make_driver():
+def make_driver(headful: bool = False):
     opts = Options()
-    if HEADLESS:
+    if not headful:
         opts.add_argument("--headless=new")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
@@ -464,17 +461,24 @@ def scrape_description(driver) -> str:
 # ---------- main ----------
 
 def main():
-    df = pd.read_excel(INPUT_FILE)
-    if SKU_COL not in df.columns:
-        raise SystemExit(f"Column '{SKU_COL}' not found. Available: {list(df.columns)}")
+    ap = argparse.ArgumentParser(description="Zepter JO scraper by SKU")
+    ap.add_argument("--in", dest="inp", required=True, help="Input Excel file")
+    ap.add_argument("--out", required=True, help="Output Excel file")
+    ap.add_argument("--sku-col", dest="sku_col", default="Item Code", help="SKU column name (default: Item Code)")
+    ap.add_argument("--headful", action="store_true", help="Show browser window")
+    args = ap.parse_args()
 
-    driver = make_driver()
+    df = pd.read_excel(args.inp)
+    if args.sku_col not in df.columns:
+        raise SystemExit(f"Column '{args.sku_col}' not found. Available: {list(df.columns)}")
+
+    driver = make_driver(headful=args.headful)
     wait = WebDriverWait(driver, TIMEOUT)
     out_desc = []
 
     try:
         for i, row in df.iterrows():
-            sku = str(row.get(SKU_COL, "")).strip()
+            sku = str(row.get(args.sku_col, "")).strip()
             if not sku:
                 out_desc.append(""); continue
 
@@ -507,9 +511,9 @@ def main():
 
     df = df.copy()
     df["description"] = out_desc
-    Path(OUTPUT_FILE).parent.mkdir(parents=True, exist_ok=True)
-    df.to_excel(OUTPUT_FILE, index=False)
-    print(f"Saved {OUTPUT_FILE}")
+    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+    df.to_excel(args.out, index=False)
+    print(f"Saved {args.out}")
 
 
 if __name__ == "__main__":

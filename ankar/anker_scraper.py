@@ -8,6 +8,7 @@ image URLs (joined by ';'). Results are saved to
 """
 from __future__ import annotations
 
+import argparse
 import logging
 import time
 from collections import OrderedDict
@@ -23,8 +24,6 @@ from urllib.parse import urlencode, urljoin, urlsplit, parse_qs
 
 BASE_URL = "https://anker.com.sg"
 SEARCH_PATH = "/search"
-INPUT_PATH = r"D:\JafarShop\Scrapers\ankar\Anker.xlsx"
-OUTPUT_PATH = "anker_products_scraped.xlsx"
 REQUEST_TIMEOUT = 20
 SLEEP_SECONDS = 1.0
 
@@ -307,23 +306,24 @@ class AnkerScraper:
         return 0
 
 
-def run() -> None:
+def run(inp: str, out: str, sku_col: Optional[str] = None) -> None:
     scraper = AnkerScraper()
     try:
-        source_df = pd.read_excel(INPUT_PATH)
+        source_df = pd.read_excel(inp)
     except Exception as exc:
         raise SystemExit(f"Failed to read input Excel file: {exc}") from exc
 
-    # Normalize column names and find SKU column
     source_df.columns = [str(col).replace("\n", " ").strip() for col in source_df.columns]
-    sku_col = None
-    for col in source_df.columns:
-        if "SKU" in col.upper() or "MODEL" in col.upper():
-            sku_col = col
-            break
-    
+    if sku_col and sku_col in source_df.columns:
+        pass
+    else:
+        sku_col = None
+        for col in source_df.columns:
+            if "SKU" in col.upper() or "MODEL" in col.upper():
+                sku_col = col
+                break
     if not sku_col:
-        raise SystemExit("Input Excel must have a 'SKU' or 'Model' column.")
+        raise SystemExit("Input Excel must have a 'SKU' or 'Model' column (or pass --sku-col).")
 
     results: List[dict] = []
     for sku_value in source_df[sku_col]:
@@ -353,11 +353,16 @@ def run() -> None:
         time.sleep(SLEEP_SECONDS)
 
     output_df = pd.DataFrame(results)
-    output_df.to_excel(OUTPUT_PATH, index=False)
-    logging.info("Saved results to %s", OUTPUT_PATH)
+    output_df.to_excel(out, index=False)
+    logging.info("Saved results to %s", out)
 
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
-    run()
+    ap = argparse.ArgumentParser(description="Anker Singapore scraper by SKU")
+    ap.add_argument("--in", dest="inp", required=True, help="Input Excel file")
+    ap.add_argument("--out", required=True, help="Output Excel file")
+    ap.add_argument("--sku-col", dest="sku_col", default=None, help="SKU column name (auto-detect if omitted)")
+    args = ap.parse_args()
+    run(args.inp, args.out, args.sku_col)
 

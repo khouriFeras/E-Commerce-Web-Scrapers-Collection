@@ -8,6 +8,7 @@ and image URLs (joined by ';'). Results are saved to
 """
 from __future__ import annotations
 
+import argparse
 import logging
 import time
 import re
@@ -27,8 +28,6 @@ UK_PRODUCT_BASE = "https://www.anker.com/uk/products/"
 UK_BASE_URL = "https://www.anker.com"
 UK_SHOPIFY_DOMAIN = "ankeruk.myshopify.com"
 UK_LOCALE = "en-gb"
-INPUT_PATH = r"D:\JafarShop\Scrapers\ankar\anker_products_scraped_sg.xlsx"
-OUTPUT_PATH = "anker_products_scraped_uk.xlsx"
 REQUEST_TIMEOUT = 20
 SLEEP_SECONDS = 1.0
 
@@ -397,23 +396,24 @@ class AnkerScraperUK:
         return 0
 
 
-def run() -> None:
+def run(inp: str, out: str, sku_col: Optional[str] = None) -> None:
     scraper = AnkerScraperUK()
     try:
-        source_df = pd.read_excel(INPUT_PATH)
+        source_df = pd.read_excel(inp)
     except Exception as exc:
         raise SystemExit(f"Failed to read input Excel file: {exc}") from exc
 
-    # Normalize column names and find SKU column
     source_df.columns = [str(col).replace("\n", " ").strip() for col in source_df.columns]
-    sku_col = None
-    for col in source_df.columns:
-        if "SKU" in col.upper() or "MODEL" in col.upper():
-            sku_col = col
-            break
-    
+    if sku_col and sku_col in source_df.columns:
+        pass
+    else:
+        sku_col = None
+        for col in source_df.columns:
+            if "SKU" in col.upper() or "MODEL" in col.upper():
+                sku_col = col
+                break
     if not sku_col:
-        raise SystemExit("Input Excel must have a 'SKU' or 'Model' column.")
+        raise SystemExit("Input Excel must have a 'SKU' or 'Model' column (or pass --sku-col).")
 
     results: List[dict] = []
     for sku_value in source_df[sku_col]:
@@ -435,26 +435,28 @@ def run() -> None:
         result.status = page_data.status
         result.error = page_data.error
         result.found_sku = page_data.found_sku
-        
-        if page_data.status == "error" or page_data.status == "sku_mismatch":
-            # Don't extract data if SKU doesn't match or there's an error
-            pass
-        else:
+
+        if page_data.status not in ("error", "sku_mismatch"):
             result.title = page_data.title
             result.description = page_data.description
             result.images = page_data.images
-        
+
         results.append(result.as_dict())
         time.sleep(SLEEP_SECONDS)
 
     output_df = pd.DataFrame(results)
-    output_df.to_excel(OUTPUT_PATH, index=False)
-    logging.info("Saved results to %s", OUTPUT_PATH)
+    output_df.to_excel(out, index=False)
+    logging.info("Saved results to %s", out)
 
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
-    run()
+    ap = argparse.ArgumentParser(description="Anker UK scraper by SKU (with SKU verification)")
+    ap.add_argument("--in", dest="inp", required=True, help="Input Excel file")
+    ap.add_argument("--out", required=True, help="Output Excel file")
+    ap.add_argument("--sku-col", dest="sku_col", default=None, help="SKU column name (auto-detect if omitted)")
+    args = ap.parse_args()
+    run(args.inp, args.out, args.sku_col)
 
 
 

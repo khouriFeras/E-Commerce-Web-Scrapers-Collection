@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+import argparse
 import re
 import time
 import pandas as pd
@@ -13,11 +14,7 @@ from selenium.webdriver.support import expected_conditions as EC
 
 
 # -------------------- CONFIG --------------------
-EXCEL_PATH = r"bestWays\TMAIN_Prodcuts_Price_List_V1 (2).xlsx"
-MODEL_COL = "Model"
 BASE_URL = "https://bestways.com"
-
-HEADLESS = False
 WAIT_TIMEOUT = 25
 PAUSE_BETWEEN_MODELS = 0.6
 
@@ -370,34 +367,32 @@ def scrape_images_highres(driver):
 
 # -------------------- MAIN --------------------
 def main():
-    df = pd.read_excel(EXCEL_PATH)
+    ap = argparse.ArgumentParser(description="BestWays scraper by model/SKU")
+    ap.add_argument("--in", dest="inp", required=True, help="Input Excel file")
+    ap.add_argument("--out", required=True, help="Output Excel file")
+    ap.add_argument("--sku-col", dest="sku_col", default="Model", help="Column containing model/SKU (default: Model)")
+    ap.add_argument("--headful", action="store_true", help="Show browser window")
+    args = ap.parse_args()
 
-    if MODEL_COL not in df.columns:
-        raise ValueError(f'Excel must contain column "{MODEL_COL}"')
+    df = pd.read_excel(args.inp)
 
-    # Ensure output columns exist
-    for col in [
-        "product_url",
-        "title",
-        "description",
-        "images_highres",
-        "scrape_status",
-        "scrape_error",
-    ]:
+    if args.sku_col not in df.columns:
+        raise ValueError(f'Excel must contain column "{args.sku_col}". Available: {list(df.columns)}')
+
+    for col in ["product_url", "title", "description", "images_highres", "scrape_status", "scrape_error"]:
         if col not in df.columns:
             df[col] = ""
 
-    driver = build_driver(headless=HEADLESS)
+    driver = build_driver(headless=not args.headful)
 
     try:
         for idx, row in df.iterrows():
-            model = clean_model(row[MODEL_COL])
+            model = clean_model(row[args.sku_col])
 
             if not model:
                 df.at[idx, "scrape_status"] = "SKIPPED"
                 continue
 
-            # Skip already scraped rows (optional but recommended)
             if str(row["scrape_status"]).strip() == "OK":
                 continue
 
@@ -416,8 +411,6 @@ def main():
                     continue
 
                 driver.get(product_url)
-                
-                # Verify SKU is mentioned on the product page
                 sku_found = verify_sku_on_page(driver, model)
 
                 df.at[idx, "product_url"] = product_url
@@ -425,8 +418,7 @@ def main():
                 df.at[idx, "description"] = scrape_description(driver)
                 df.at[idx, "images_highres"] = scrape_images_highres(driver)
                 df.at[idx, "scrape_status"] = "OK"
-                
-                # Record SKU verification warning in Excel
+
                 if not sku_found:
                     df.at[idx, "scrape_error"] = f"WARNING: SKU '{model}' NOT found on product page"
 
@@ -439,9 +431,8 @@ def main():
     finally:
         driver.quit()
 
-    # 🔥 WRITE BACK TO THE SAME EXCEL FILE
-    df.to_excel(EXCEL_PATH, index=False)
-    print(f"\nUpdated original Excel file:\n{EXCEL_PATH}")
+    df.to_excel(args.out, index=False)
+    print(f"\nSaved results to: {args.out}")
 
 
 if __name__ == "__main__":

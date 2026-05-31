@@ -1,5 +1,6 @@
 # Google approach: read product names from Excel → search "<name> arabi emart" → take first result → save
 # Prints fetched links and HTML snippet in the terminal
+import argparse
 import sys
 import os
 import re
@@ -9,9 +10,6 @@ from urllib.parse import urlparse, parse_qs, quote_plus
 import pandas as pd
 from playwright.sync_api import sync_playwright
 
-INPUT_EXCEL = "Arabi E-mart - New Suppliers.xlsx"
-SHEET_NAME = 0
-NAME_COL = "Sellers"
 OUTPUT_XLSX = "product_first_links.xlsx"
 CHECKPOINT_EVERY = 25
 DEFAULT_TIMEOUT_MS = 15000
@@ -113,12 +111,18 @@ def ddg_first_result(page, query):
 
 
 def main():
-    if not os.path.exists(INPUT_EXCEL):
-        raise FileNotFoundError(f"Input Excel not found: {INPUT_EXCEL}")
-    df = pd.read_excel(INPUT_EXCEL, sheet_name=SHEET_NAME)
-    if NAME_COL not in df.columns:
-        raise ValueError(f"Column '{NAME_COL}' not found in {INPUT_EXCEL}")
-    names = [str(x).strip() for x in df[NAME_COL].fillna("")]
+    ap = argparse.ArgumentParser(description="Suppliers / Arabi E-mart link scraper")
+    ap.add_argument("--in", dest="inp", required=True, help="Input Excel file")
+    ap.add_argument("--out", required=True, help="Output Excel file")
+    ap.add_argument("--sku-col", dest="sku_col", default="Sellers", help="Column with product names (default: Sellers)")
+    args = ap.parse_args()
+
+    if not os.path.exists(args.inp):
+        raise FileNotFoundError(f"Input Excel not found: {args.inp}")
+    df = pd.read_excel(args.inp)
+    if args.sku_col not in df.columns:
+        raise ValueError(f"Column '{args.sku_col}' not found. Available: {list(df.columns)}")
+    names = [str(x).strip() for x in df[args.sku_col].fillna("")]
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -157,11 +161,11 @@ def main():
             })
 
             if i % CHECKPOINT_EVERY == 0:
-                pd.DataFrame(rows).to_excel(OUTPUT_XLSX, index=False)
-                print(f"[checkpoint] saved {len(rows)} rows → {OUTPUT_XLSX}", flush=True)
+                pd.DataFrame(rows).to_excel(args.out, index=False)
+                print(f"[checkpoint] saved {len(rows)} rows → {args.out}", flush=True)
 
-        pd.DataFrame(rows).to_excel(OUTPUT_XLSX, index=False)
-        print(f"Saved {len(rows)} rows → {OUTPUT_XLSX}", flush=True)
+        pd.DataFrame(rows).to_excel(args.out, index=False)
+        print(f"Saved {len(rows)} rows → {args.out}", flush=True)
         browser.close()
 
 

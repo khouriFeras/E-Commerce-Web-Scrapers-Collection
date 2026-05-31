@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>JafarShop Scraper Launcher</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>JafarShop Scraper Launcher</h1>
+      <p class="subtitle">Upload your Excel/CSV, choose your scraper, and get results.</p>
+    </header>
+
+    <!-- ── Step 1: Upload ── -->
+    <section class="card" id="step1">
+      <div class="step-label">Step 1 — Upload file</div>
+      <div class="drop-zone" id="dropZone">
+        <svg xmlns="http://www.w3.org/2000/svg" width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M4 16v2a2 2 0 002 2h12a2 2 0 002-2v-2M8 12l4-4 4 4M12 8v8"/></svg>
+        <p>Drag &amp; drop your file here, or <label class="link" for="fileInput">browse</label></p>
+        <p class="hint">.xlsx, .xls or .csv</p>
+        <input type="file" id="fileInput" accept=".xlsx,.xls,.csv" hidden />
+      </div>
+      <div id="fileStatus" class="file-status hidden"></div>
+    </section>
+
+    <!-- ── Step 2: Choose column ── -->
+    <section class="card hidden" id="step2">
+      <div class="step-label">Step 2 — Select SKU / search column</div>
+      <select id="colSelect">
+        <option value="">— pick a column —</option>
+      </select>
+      <p class="hint">This is the column containing the SKU, barcode, or search term the scraper will use.</p>
+    </section>
+
+    <!-- ── Step 3: Choose scraper ── -->
+    <section class="card hidden" id="step3">
+      <div class="step-label">Step 3 — Choose scraper</div>
+      <div class="scraper-grid" id="scraperGrid">
+        {% for s in scrapers %}
+        <button class="scraper-btn" data-id="{{ s.id }}" title="{{ s.description }}">
+          <span class="scraper-name">{{ s.name }}</span>
+          <span class="scraper-desc">{{ s.description }}</span>
+        </button>
+        {% endfor %}
+      </div>
+    </section>
+
+    <!-- ── Step 4: Run ── -->
+    <section class="card hidden" id="step4">
+      <div class="step-label">Step 4 — Run</div>
+      <div class="run-summary" id="runSummary"></div>
+      <button class="btn-run" id="btnRun">Start Scraping</button>
+    </section>
+
+    <!-- ── Progress ── -->
+    <section class="card hidden" id="stepProgress">
+      <div class="step-label">Progress</div>
+      <div class="log-box" id="logBox"></div>
+      <div class="progress-status" id="progressStatus"></div>
+      <button class="btn-download hidden" id="btnDownload">⬇ Download Results</button>
+      <button class="btn-reset" id="btnReset">Start Over</button>
+    </section>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

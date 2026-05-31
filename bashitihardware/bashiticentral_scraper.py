@@ -14,7 +14,7 @@ import re
 import time
 import json
 import sys
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlparse
 from typing import List, Dict, Any, Optional
 from pathlib import Path
 import pandas as pd
@@ -93,9 +93,32 @@ def is_no_search_results(driver) -> bool:
         return False
 
 
-def get_product_url_from_search(driver, search_url: str, wait: WebDriverWait, pause: float) -> Optional[str]:
+def _norm_sku_text(value: str) -> str:
+    """Normalize SKU text for reliable comparison."""
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").strip().lower())
+
+
+def _sku_matches_expected(expected_sku: str, scraped_sku: str) -> bool:
     """
-    Open the search URL and return the first product page URL, or None if no results.
+    Compare SKU values leniently:
+    - exact match after normalization
+    - containment for cases like separators/extra suffixes
+    """
+    expected = _norm_sku_text(expected_sku)
+    scraped = _norm_sku_text(scraped_sku)
+    if not expected or not scraped:
+        return False
+    if expected == scraped:
+        return True
+    # Keep containment strict enough to avoid tiny accidental matches.
+    if len(expected) >= 4 and (expected in scraped or scraped in expected):
+        return True
+    return False
+
+
+def get_product_urls_from_search(driver, search_url: str, wait: WebDriverWait, pause: float) -> List[str]:
+    """
+    Open the search URL and return all product URLs from results.
     """
     try:
         driver.get(search_url)
@@ -114,11 +137,132 @@ def get_product_url_from_search(driver, search_url: str, wait: WebDriverWait, pa
         # Extra moment for JS-rendered product links
         time.sleep(1.0)
         if is_no_search_results(driver):
-            return None
-        # Use same broad logic to get first product URL
-        return next(_get_search_result_product_links(driver), None)
+            return []
+        return list(_get_search_result_product_links(driver))
+    except Exception:
+        return []
+
+
+def get_product_url_from_search(driver, search_url: str, wait: WebDriverWait, pause: float) -> Optional[str]:
+    """Backward-compatible helper returning first product URL from search."""
+    try:
+        urls = get_product_urls_from_search(driver, search_url, wait, pause)
+        return urls[0] if urls else None
     except Exception:
         return None
+
+
+def scrape_search_results_page(
+    driver,
+    search_url: str,
+    wait: WebDriverWait,
+    pause: float,
+    searched_sku: str,
+    max_images: int = 10,
+) -> Dict[str, Any]:
+    """
+    Scrape data directly from WooCommerce search results page (no product-page navigation).
+    """
+    result = {
+        "ProductURL": search_url,
+        "SKU": searched_sku,
+        "Title": "",
+        "Price": "",
+        "Description": "",
+        "Images": [],
+        "Found": False,
+        "Status": "NOT_FOUND",
+        "Note": "No products in search results",
+    }
+
+    try:
+        driver.get(search_url)
+        time.sleep(pause)
+        current_url = (driver.current_url or "").strip()
+
+        # If the search URL redirects directly to a product page, scrape it as product.
+        # This still follows the "no click" flow because navigation happened by URL redirect.
+        if "/product/" in current_url or "/single-product/" in current_url:
+            direct = scrape_product(driver, current_url, wait, 0, max_images)
+            if not direct.get("SKU"):
+                direct["SKU"] = searched_sku
+            note = direct.get("Note", "")
+            redirect_note = "Direct redirect from search URL to product page"
+            direct["Note"] = f"{note} | {redirect_note}" if note else redirect_note
+            return direct
+
+        try:
+            wait.until(
+                EC.presence_of_element_located(
+                    (
+                        By.CSS_SELECTOR,
+                        ".products, .woocommerce-info, .woocommerce-no-products-found, "
+                        "li.product, a[href*='/product/']",
+                    )
+                )
+            )
+        except TimeoutException:
+            pass
+        time.sleep(1.0)
+
+        if is_no_search_results(driver):
+            return result
+
+        soup = BeautifulSoup(driver.page_source or "", "html.parser")
+        cards = soup.select("ul.products li.product, .products li.product, li.product")
+        if not cards:
+            cards = soup.select(".products .product")
+        if not cards:
+            result["Status"] = "ERROR"
+            result["Note"] = "Search page loaded but no product cards were parsed"
+            return result
+
+        # Prefer the card containing the searched SKU text; fallback to first card.
+        chosen = cards[0]
+        for card in cards:
+            card_text = card.get_text(" ", strip=True)
+            if _sku_matches_expected(searched_sku, card_text):
+                chosen = card
+                break
+
+        # URL
+        link = chosen.select_one(
+            "a.woocommerce-loop-product__link[href], a[href*='/product/'][href], a[href]"
+        )
+        if link and link.get("href"):
+            href = str(link.get("href")).strip()
+            result["ProductURL"] = _normalize_image_url(href)
+
+        # Title
+        title_el = chosen.select_one(
+            ".woocommerce-loop-product__title, .product-title, h2, h3, h4, .wd-entities-title"
+        )
+        if title_el:
+            result["Title"] = " ".join(title_el.get_text(" ", strip=True).split())
+
+        # Price
+        price_el = chosen.select_one(".new-price, .price, .woocommerce-Price-amount, bdi")
+        if price_el:
+            result["Price"] = " ".join(price_el.get_text(" ", strip=True).split())
+
+        # Images
+        image_candidates: List[str] = []
+        for img in chosen.select("img"):
+            for attr in ("data-large_image", "data-zoom_image", "data-src", "src"):
+                v = img.get(attr)
+                if v:
+                    image_candidates.append(v)
+            image_candidates.extend(_urls_from_srcset(img.get("srcset") or ""))
+        result["Images"] = pick_largest_image_urls(image_candidates)[:max_images]
+
+        result["Found"] = True
+        result["Status"] = "FOUND"
+        result["Note"] = "Scraped from search results page (no product-page click)"
+        return result
+    except Exception as e:
+        result["Status"] = "ERROR"
+        result["Note"] = f"Failed scraping search results page: {e}"
+        return result
 
 
 def is_laravel_error_page(driver) -> bool:
@@ -255,205 +399,291 @@ def extract_price(driver) -> str:
 
 
 def extract_description(driver) -> str:
-    """Extract product description from product page. Description is NOT in product-title elements."""
-    try:
-        # Description is NOT in product-title elements
-        # Try common description selectors
-        desc_selectors = [
-            ".product-description",
-            ".description",
-            ".product-content",
-            ".product-details",
-            ".product-info",
-            ".product-summary",
-            ".woocommerce-product-details__short-description",
-            ".entry-content",
-            ".product-summary .description",
-            "#tab-description",
-            ".woocommerce-Tabs-panel--description",
-            ".product-text",
-            "[class*='description']",
-            "[class*='content']",
-            "p.description",
-            "div.description"
+    """
+    Product description only — avoid `.product-summary` / broad `[class*='content']`
+    which pulls breadcrumbs, price, stock, and buttons.
+    """
+    heading_tags = frozenset({"h1", "h2", "h3", "h4", "h5", "h6"})
+
+    def _clean_desc(text: str) -> str:
+        if not text:
+            return ""
+        junk_line_markers = [
+            "free delivery",
+            "secure payment",
+            "support 24/7",
+            "الرئيسية",
+            "إضافة إلى السلة",
+            "أضف إلى المفضلة",
+            "مقارنة",
+            "share:",
+            "buy now",
+            "click to enlarge",
+            "back to products",
         ]
-        
-        title_text = extract_title(driver)  # Get title to compare and exclude
-        
-        for selector in desc_selectors:
-            try:
-                desc_elems = driver.find_elements(By.CSS_SELECTOR, selector)
-                for desc_elem in desc_elems:
-                    desc_text = desc_elem.text.strip()
-                    # Skip if it's the same as title or too short
-                    if desc_text and desc_text != title_text and len(desc_text) > 20:
-                        return desc_text
-            except NoSuchElementException:
+        lines = [ln.strip() for ln in str(text).splitlines()]
+        kept: List[str] = []
+        for ln in lines:
+            if not ln:
                 continue
-        
-        # Try to find description by looking for paragraphs or divs with substantial text
-        try:
-            # Look for paragraphs that might contain description
-            paragraphs = driver.find_elements(By.TAG_NAME, "p")
-            for p in paragraphs:
-                text = p.text.strip()
-                # Skip if it's title or too short, but look for longer text
-                if text and text != title_text and len(text) > 50:
-                    # Check if it's not a price or SKU
-                    if not re.match(r'^[\d\s.,]+$', text):  # Not just numbers
-                        return text
-        except Exception:
-            pass
-        
+            if any(m in ln for m in junk_line_markers):
+                continue
+            low = ln.lower()
+            if any(m in low for m in ("share:", "buy now", "click to enlarge", "back to products")):
+                continue
+            kept.append(ln)
+        return " ".join(" ".join(kept).split()).strip()
+
+    def _norm_heading_text(tag) -> str:
+        return " ".join((tag.get_text(" ", strip=True) or "").split())
+
+    def _is_description_heading(tag) -> bool:
+        if getattr(tag, "name", None) not in heading_tags:
+            return False
+        t = _norm_heading_text(tag)
+        tl = t.lower()
+        return tl == "description" or t == "الوصف"
+
+    def _is_recently_viewed_heading(tag) -> bool:
+        if getattr(tag, "name", None) not in heading_tags:
+            return False
+        t = _norm_heading_text(tag)
+        tl = t.lower()
+        return tl == "recently viewed" or "شوهد مؤخر" in t
+
+    try:
+        soup = BeautifulSoup(driver.page_source or "", "html.parser")
+
+        # 1) WoodMart / Elementor product body (same as bashitihardware_scraper.py)
+        widget = soup.select_one(
+            ".wd-single-content.elementor-widget-wd_single_product_content .elementor-widget-container"
+        )
+        if widget:
+            parts: List[str] = []
+            h3 = widget.find("h3")
+            if h3:
+                t = _clean_desc(h3.get_text("\n", strip=True))
+                if t:
+                    parts.append(t)
+            ul = widget.find("ul")
+            if ul:
+                items = []
+                for li in ul.find_all("li"):
+                    t = _clean_desc(li.get_text("\n", strip=True))
+                    if t:
+                        items.append(t)
+                if items:
+                    parts.append("\n".join(f"- {x}" for x in items))
+            final = "\n".join(p for p in parts if p).strip()
+            if final:
+                return final
+
+        # 2) WooCommerce description tab (safe, narrow)
+        tab = soup.select_one("#tab-description, .woocommerce-Tabs-panel--description")
+        if tab:
+            text = _clean_desc(tab.get_text("\n", strip=True))
+            if text and len(text) > 20:
+                return text
+
+        # 3) Between "Description" / "الوصف" and "Recently Viewed"
+        desc_header = soup.find(_is_description_heading)
+        if desc_header:
+            collected: List[str] = []
+            seen = set()
+            for el in desc_header.find_all_next():
+                if getattr(el, "name", None) in heading_tags and _is_recently_viewed_heading(el):
+                    break
+                name = getattr(el, "name", None)
+                if name not in {"p", "li", "h3", "h4"}:
+                    continue
+                text = _clean_desc(el.get_text("\n", strip=True))
+                if not text or len(text) <= 3:
+                    continue
+                line = f"- {text}" if name == "li" else text
+                if line not in seen:
+                    seen.add(line)
+                    collected.append(line)
+            out = "\n".join(collected).strip()
+            if out and len(out) > 20:
+                return out
+
         return ""
-    except Exception as e:
+    except Exception:
         return ""
+
+
+IMAGE_BASE = "https://bashitihardware.com"
+
+
+def _normalize_image_url(u: str) -> str:
+    u = (u or "").strip()
+    if not u:
+        return ""
+    if u.startswith("//"):
+        return "https:" + u
+    if u.startswith("/"):
+        return IMAGE_BASE + u
+    return u
+
+
+def _urls_from_srcset(srcset: str) -> List[str]:
+    urls: List[str] = []
+    for part in (srcset or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        urls.append(part.split()[0])
+    return urls
+
+
+def _image_identity_key(u: str) -> str:
+    """Group same image across WP/WooCommerce size variants."""
+    path = urlparse(u).path.lower()
+    name = path.split("/")[-1]
+    name = re.sub(r"-\d+x\d+(?=\.[a-z0-9]+$)", "", name)
+    path = re.sub(r"/cache/[^/]+/", "/", path)
+    return path or name
+
+
+def _image_size_score(u: str) -> int:
+    u_l = u.lower()
+    score = 0
+
+    for m in re.finditer(r"(\d{2,4})x(\d{2,4})", u_l):
+        w, h = int(m.group(1)), int(m.group(2))
+        score = max(score, w * h)
+
+    m = re.search(r"/cache/w(\d+)(?:/|$)", u_l)
+    if m:
+        w = int(m.group(1))
+        score = max(score, w * w)
+
+    if "zoom" in u_l or "large" in u_l or "full" in u_l:
+        score += 500
+    if "thumbnail" in u_l or "thumb" in u_l:
+        score -= 10_000
+    if "small" in u_l or "swatch" in u_l:
+        score -= 5_000
+    if not re.search(r"-\d+x\d+\.", u_l) and "/cache/w" not in u_l:
+        score += 1_000
+
+    return score
+
+
+def pick_largest_image_urls(candidates: List[str]) -> List[str]:
+    """One URL per image — keep the largest variant."""
+    best: Dict[str, tuple[int, str]] = {}
+    order: List[str] = []
+
+    for raw in candidates:
+        u = _normalize_image_url(raw)
+        if not u.startswith("http") or "placeholder" in u.lower():
+            continue
+        key = _image_identity_key(u)
+        if key not in order:
+            order.append(key)
+        s = _image_size_score(u)
+        if key not in best or s > best[key][0]:
+            best[key] = (s, u)
+
+    return [best[k][1] for k in order if k in best]
+
+
+def _collect_img_candidates(img) -> List[str]:
+    urls: List[str] = []
+    for attr in ("data-large_image", "data-zoom_image", "data-src", "src"):
+        v = img.get_attribute(attr)
+        if v:
+            urls.append(v)
+    srcset = img.get_attribute("srcset")
+    if srcset:
+        urls.extend(_urls_from_srcset(srcset))
+    return urls
+
+
+def _collect_element_candidates(elem) -> List[str]:
+    urls: List[str] = []
+    href = elem.get_attribute("href")
+    if href:
+        urls.append(href)
+    try:
+        for img in elem.find_elements(By.TAG_NAME, "img"):
+            urls.extend(_collect_img_candidates(img))
+    except Exception:
+        pass
+    return urls
 
 
 def extract_images(driver, max_images: int = 10) -> List[str]:
-    """Extract product images from product page. Prioritizes easyzoom images."""
-    images = []
-    
+    """Extract product images; keep only the largest size per image."""
+    candidates: List[str] = []
+
     try:
-        # Priority 1: Look for images in easyzoom containers (main product images)
-        # Easyzoom is often implemented as <a class="easyzoom"> with href pointing to full-size image
         easyzoom_selectors = [
             "a.easyzoom.easyzoom--overlay.is-ready",
             "a.easyzoom",
             ".easyzoom.easyzoom--overlay.is-ready",
             ".easyzoom",
-            "[class*='easyzoom']"
+            "[class*='easyzoom']",
         ]
-        
         for selector in easyzoom_selectors:
             try:
-                easyzoom_elements = driver.find_elements(By.CSS_SELECTOR, selector)
-                for elem in easyzoom_elements:
-                    # First try href from anchor (full-size image)
-                    src = elem.get_attribute("href")
-                    
-                    # If no href, look for img inside the element
-                    if not src:
-                        try:
-                            img = elem.find_element(By.TAG_NAME, "img")
-                            src = (img.get_attribute("src") or 
-                                   img.get_attribute("data-src") or 
-                                   img.get_attribute("data-large_image") or
-                                   img.get_attribute("data-zoom_image"))
-                        except NoSuchElementException:
-                            continue
-                    
-                    if src:
-                        # Handle relative URLs
-                        if src.startswith("//"):
-                            src = "https:" + src
-                        elif src.startswith("/"):
-                            src = "https://bashitihardware.com" + src
-                        
-                        if src.startswith("http") and "placeholder" not in src.lower():
-                            if src not in images:
-                                images.append(src)
-                                
-                                if len(images) >= max_images:
-                                    break
-                
-                if images:
+                for elem in driver.find_elements(By.CSS_SELECTOR, selector):
+                    candidates.extend(_collect_element_candidates(elem))
+                if candidates:
                     break
             except Exception:
                 continue
-        
-        # Priority 2: Fallback to other product image selectors if easyzoom not found
-        if not images:
+
+        if not candidates:
             img_selectors = [
+                ".woocommerce-product-gallery__image a",
+                ".woocommerce-product-gallery__image img",
                 ".product-gallery img",
                 ".product-images img",
-                ".woocommerce-product-gallery__image img",
                 "img.product-image",
-                ".product-thumbnails img",
                 ".wp-post-image",
-                ".product-single img"
+                ".product-single img",
             ]
-            
             for selector in img_selectors:
                 try:
-                    img_elements = driver.find_elements(By.CSS_SELECTOR, selector)
-                    for img in img_elements:
-                        src = (img.get_attribute("src") or 
-                               img.get_attribute("data-src") or 
-                               img.get_attribute("data-large_image") or
-                               img.get_attribute("data-zoom_image"))
-                        
-                        if src:
-                            # Handle relative URLs
-                            if src.startswith("//"):
-                                src = "https:" + src
-                            elif src.startswith("/"):
-                                src = "https://bashitihardware.com" + src
-                            
-                            if src.startswith("http") and "placeholder" not in src.lower():
-                                if src not in images:
-                                    images.append(src)
-                                    
-                                    if len(images) >= max_images:
-                                        break
-                    
-                    if images:
+                    for elem in driver.find_elements(By.CSS_SELECTOR, selector):
+                        tag = (elem.tag_name or "").lower()
+                        if tag == "img":
+                            candidates.extend(_collect_img_candidates(elem))
+                        else:
+                            candidates.extend(_collect_element_candidates(elem))
+                    if candidates:
                         break
                 except Exception:
                     continue
-        
-        # Priority 3: Use BeautifulSoup to parse easyzoom elements from HTML
-        if not images:
-            try:
-                soup = BeautifulSoup(driver.page_source, "html.parser")
-                
-                # First try easyzoom elements (often anchor tags)
-                easyzoom_elements = soup.find_all(class_=re.compile("easyzoom"))
-                for elem in easyzoom_elements:
-                    # First try href from anchor (full-size image URL)
-                    src = elem.get("href")
-                    
-                    # If no href, look for img tag inside easyzoom
-                    if not src:
-                        img = elem.find("img")
-                        if img:
-                            src = (img.get("src") or 
-                                   img.get("data-src") or 
-                                   img.get("data-large_image") or
-                                   img.get("data-zoom_image"))
-                    
-                    if src:
-                        if src.startswith("//"):
-                            src = "https:" + src
-                        elif src.startswith("/"):
-                            src = "https://bashitihardware.com" + src
-                        
-                        if src.startswith("http") and "placeholder" not in src.lower():
-                            if src not in images and len(images) < max_images:
-                                images.append(src)
-                
-                # Final fallback: all images
-                if not images:
-                    for img in soup.find_all("img"):
-                        src = (img.get("src") or 
-                               img.get("data-src") or 
-                               img.get("data-large_image"))
-                        
-                        if src:
-                            if src.startswith("//"):
-                                src = "https:" + src
-                            elif src.startswith("/"):
-                                src = "https://bashitihardware.com" + src
-                            
-                            if src.startswith("http") and "placeholder" not in src.lower():
-                                if src not in images and len(images) < max_images:
-                                    images.append(src)
-            except Exception:
-                pass
-        
-        return images[:max_images]
-        
-    except Exception as e:
+
+        if not candidates:
+            soup = BeautifulSoup(driver.page_source, "html.parser")
+            for elem in soup.find_all(class_=re.compile("easyzoom")):
+                href = elem.get("href")
+                if href:
+                    candidates.append(href)
+                for img in elem.find_all("img"):
+                    for attr in ("data-large_image", "data-zoom_image", "data-src", "src"):
+                        v = img.get(attr)
+                        if v:
+                            candidates.append(v)
+                    candidates.extend(_urls_from_srcset(img.get("srcset") or ""))
+
+            if not candidates:
+                for img in soup.select(
+                    ".woocommerce-product-gallery__image img, .product-gallery img, .wp-post-image"
+                ):
+                    for attr in ("data-large_image", "data-zoom_image", "data-src", "src"):
+                        v = img.get(attr)
+                        if v:
+                            candidates.append(v)
+                    candidates.extend(_urls_from_srcset(img.get("srcset") or ""))
+
+        return pick_largest_image_urls(candidates)[:max_images]
+
+    except Exception:
         return []
 
 
@@ -647,6 +877,49 @@ def find_sku_or_url_column(df: pd.DataFrame, user_col: Optional[str] = None) -> 
     return None
 
 
+def resolve_input_path(path_str: str) -> tuple[Optional[Path], List[Path]]:
+    """Resolve input file from cwd, script directory, or absolute path."""
+    raw = Path(path_str)
+    script_dir = Path(__file__).resolve().parent
+
+    bases: List[Path] = []
+    if raw.is_absolute():
+        bases.append(raw)
+    else:
+        bases.append(Path.cwd() / raw)
+        bases.append(script_dir / raw.name)
+        if raw.parts and raw.parts[0].lower() == script_dir.name.lower():
+            bases.append(script_dir / Path(*raw.parts[1:]))
+        bases.append(script_dir / raw)
+
+    if raw.suffix.lower() == ".xlsx":
+        alt_extensions = [".xls", ".XLS"]
+    elif raw.suffix.lower() == ".xls":
+        alt_extensions = [".xlsx", ".XLSX"]
+    else:
+        alt_extensions = [".xls", ".xlsx", ".XLS", ".XLSX"]
+
+    tried: List[Path] = []
+    seen: set[str] = set()
+    for base in bases:
+        candidates = [base]
+        if base.suffix:
+            candidates.extend(base.with_suffix(ext) for ext in alt_extensions)
+        else:
+            candidates.extend(base.with_suffix(ext) for ext in alt_extensions)
+
+        for candidate in candidates:
+            key = str(candidate)
+            if key in seen:
+                continue
+            seen.add(key)
+            tried.append(candidate)
+            if candidate.exists():
+                return candidate.resolve(), tried
+
+    return None, tried
+
+
 def main():
     """Main function for CLI usage."""
     # Windows consoles often default to cp1252/cp1256 which can crash printing Arabic headers.
@@ -673,7 +946,7 @@ def main():
         dest="output_file", 
         # Use a simple file name; the previous path introduced an escape-sequence
         # (\b) which erased characters in the printed output.
-        default="injco_updated_scraped.xlsx",
+        default="jadeverscraped.xlsx",
         help="Output Excel file path (default: injco_updated_scraped.xlsx)"
     )
     parser.add_argument(
@@ -736,24 +1009,17 @@ def main():
         results = []
         
         def process_sku(sku: str):
-            """Search by SKU, then scrape first product if found."""
+            """Search by SKU and scrape directly from search results page."""
             search_url = search_url_template.format(quote_plus(sku))
             print(f"   → Search: {search_url}")
-            product_url = get_product_url_from_search(driver, search_url, wait, args.pause)
-            if product_url is None:
-                print(f"   ⚠️  Product not found (no search results)")
-                return {
-                    "ProductURL": search_url,
-                    "SKU": sku,
-                    "Title": "",
-                    "Price": "",
-                    "Description": "",
-                    "Images": [],
-                    "Found": False,
-                    "Status": "NOT_FOUND",
-                    "Note": "No products in search results"
-                }
-            return scrape_product(driver, product_url, wait, args.pause, args.max_img)
+            return scrape_search_results_page(
+                driver=driver,
+                search_url=search_url,
+                wait=wait,
+                pause=args.pause,
+                searched_sku=sku,
+                max_images=args.max_img,
+            )
         
         # Handle single URL (direct product page)
         if args.url:
@@ -781,40 +1047,12 @@ def main():
         
         # Handle Excel file
         elif args.input_file:
-            input_path = Path(args.input_file)
-            if not input_path.is_absolute():
-                # Try relative to script directory
-                script_dir = Path(__file__).parent
-                input_path = script_dir / args.input_file
-            
-            # If file doesn't exist, try alternative extensions
-            if not input_path.exists():
-                # Try .xls if .xlsx was provided, or .xlsx if .xls was provided
-                alt_extensions = []
-                if input_path.suffix == '.xlsx':
-                    alt_extensions = ['.xls', '.XLS']
-                elif input_path.suffix == '.xls':
-                    alt_extensions = ['.xlsx', '.XLSX']
-                else:
-                    # No extension or other extension, try both
-                    alt_extensions = ['.xls', '.xlsx', '.XLS', '.XLSX']
-                
-                found = False
-                for ext in alt_extensions:
-                    alt_path = input_path.with_suffix(ext)
-                    if alt_path.exists():
-                        input_path = alt_path
-                        found = True
-                        print(f"   → Found file: {input_path.name}")
-                        break
-                
-                if not found:
-                    print(f" Error: Input file not found: {input_path}")
-                    print(f"   Tried: {input_path}")
-                    for ext in alt_extensions:
-                        alt_path = input_path.with_suffix(ext)
-                        print(f"   Tried: {alt_path}")
-                    return
+            input_path, tried_paths = resolve_input_path(args.input_file)
+            if input_path is None:
+                print(f" Error: Input file not found: {args.input_file}")
+                for tried in tried_paths:
+                    print(f"   Tried: {tried}")
+                return
             
             print(f" Loading Excel file: {input_path}")
             try:

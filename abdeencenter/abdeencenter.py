@@ -1,3 +1,4 @@
+import argparse
 import re
 import time
 from pathlib import Path
@@ -19,18 +20,21 @@ from selenium.common.exceptions import TimeoutException, NoSuchElementException,
 BASE = "https://abdeencenter.com"
 SEARCH_URL = BASE + "/catalogsearch/result/?q={q}"
 
-INPUT_FOLDER = r"."
-INPUT_EXCEL  = r"JO CELL\Promate99.xlsx"
+SCRIPT_DIR = Path(__file__).resolve().parent
 
+# Column containing product identifiers (barcode/SKU).
+# Script auto-detects from these names; falls back to first column if none match.
+BARCODE_COL_CANDIDATES = [
+    "Barcode",
+    "barcode",
+    "SKU",
+    "sku",
+    "Sku",
+    "Item Code",
+    "item code",
+]
 
-# Save behavior:
-# - If None: overwrite same Excel file in-place (keeps existing cols, adds new ones)
-# - If set: write to this new file name (safer)
-OUTPUT_EXCEL = None  # e.g. "barcodes_with_scraped_data.xlsx"
-
-# Column name containing barcodes (script will auto-detect from candidates; otherwise uses first column)
-BARCODE_COL_CANDIDATES = ["barcode", "barCode", "Barcode", "BARCODE", "sku", "SKU"]
-
+HEADLESS = False
 HEADLESS = False
 WAIT_SEC = 20
 SLEEP_BETWEEN = 0.5
@@ -88,12 +92,31 @@ def safe_inner_html(driver, by, value) -> str:
         return ""
 
 
-def page_contains_barcode(driver, barcode: str) -> bool:
-    try:
-        body_text = driver.find_element(By.TAG_NAME, "body").text or ""
-        return barcode in body_text
-    except Exception:
+def _norm_id(s: str) -> str:
+    return re.sub(r"\s+", "", (s or "").strip()).lower()
+
+
+def get_page_sku(driver) -> str:
+    """SKU from Magento `.product.attribute.sku` block."""
+    value = safe_text(driver, By.CSS_SELECTOR, ".product.attribute.sku .value")
+    if value:
+        return value
+    block = safe_text(driver, By.CSS_SELECTOR, ".product.attribute.sku")
+    if block:
+        return re.sub(r"^(?:SKU|Sku)\s*[:#]?\s*", "", block.strip(), flags=re.I).strip()
+    return ""
+
+
+def barcode_matches_sku_attribute(driver, barcode: str) -> bool:
+    """True if barcode appears inside `.product.attribute.sku` text (not exact match)."""
+    page_sku = get_page_sku(driver)
+    if not page_sku or not barcode:
         return False
+    needle = _norm_id(barcode)
+    haystack = _norm_id(page_sku)
+    if not needle or not haystack:
+        return False
+    return needle in haystack
 
 
 def first_search_result_url(driver) -> Optional[str]:
@@ -149,39 +172,27 @@ def get_gallery_image_urls(driver) -> List[str]:
             return u.split("?")[0].split("/")[-1].lower()
 
     def rank(u: str) -> int:
-        """
-        Higher is better (more likely full-size).
-        You can tweak these if you observe different patterns on Abdeen.
-        """
+        """Higher is better — prefer largest dimensions in URL."""
         u_l = u.lower()
-
         score = 0
-        # Prefer explicit full/zoom sources
-        if "data-zoom-image" in u_l:
-            score += 100  # (won't happen here, but kept conceptually)
-        if "zoom" in u_l:
-            score += 40
-        if "large" in u_l:
-            score += 20
-        if "full" in u_l:
-            score += 20
 
-        # Thumbnails often contain these patterns
-        if "thumbnail" in u_l:
-            score -= 50
-        if "thumb" in u_l:
-            score -= 30
-        if "small" in u_l:
-            score -= 20
-        if "swatch" in u_l:
-            score -= 20
-        if "product_page_image_small" in u_l:
-            score -= 60
+        for m in re.finditer(r"(\d{2,4})x(\d{2,4})", u_l):
+            w, h = int(m.group(1)), int(m.group(2))
+            score = max(score, w * h)
 
-        # Cache URLs can appear for both, but thumbnails are often more "cache-y"
-        # so only a small penalty
-        if "/cache/" in u_l:
-            score -= 5
+        m = re.search(r"/cache/w(\d+)(?:/|$)", u_l)
+        if m:
+            w = int(m.group(1))
+            score = max(score, w * w)
+
+        if "zoom" in u_l or "large" in u_l or "full" in u_l:
+            score += 500
+        if "thumbnail" in u_l or "thumb" in u_l:
+            score -= 10_000
+        if "small" in u_l or "swatch" in u_l or "product_page_image_small" in u_l:
+            score -= 5_000
+        if not re.search(r"-\d+x\d+\.", u_l) and "/cache/w" not in u_l:
+            score += 1_000
 
         return score
 
@@ -206,10 +217,17 @@ def get_gallery_image_urls(driver) -> List[str]:
         gallery = driver.find_element(By.CSS_SELECTOR, '[data-gallery-role="gallery"]')
         imgs = gallery.find_elements(By.CSS_SELECTOR, "img")
         for img in imgs:
-            for attr in ("src", "data-src"):
+            for attr in ("src", "data-src", "data-zoom-image", "data-large-image"):
                 u = norm(img.get_attribute(attr))
                 if u:
                     candidates.append(u)
+            srcset = img.get_attribute("srcset") or ""
+            for part in srcset.split(","):
+                part = part.strip()
+                if part:
+                    u = norm(part.split()[0])
+                    if u:
+                        candidates.append(u)
     except NoSuchElementException:
         pass
 
@@ -241,9 +259,9 @@ def get_gallery_image_urls(driver) -> List[str]:
 # =========================
 # SCRAPER CORE
 # =========================
-def build_driver() -> webdriver.Chrome:
+def build_driver(headful: bool = False) -> webdriver.Chrome:
     opts = Options()
-    if HEADLESS:
+    if not headful:
         opts.add_argument("--headless=new")
     opts.add_argument("--window-size=1400,900")
     opts.add_argument("--disable-gpu")
@@ -333,16 +351,31 @@ def scrape_one_barcode(driver: webdriver.Chrome, wait: WebDriverWait, barcode: s
     out["product_url"] = url
     driver.get(url)
 
-    # 3) Wait title
+    # 3) Wait product page (title + SKU block)
     try:
-        wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, '[data-ui-id="page-title-wrapper"]')))
+        wait.until(
+            EC.presence_of_element_located(
+                (By.CSS_SELECTOR, '[data-ui-id="page-title-wrapper"], .product.attribute.sku')
+            )
+        )
     except TimeoutException:
         out["status"] = "product_page_timeout"
         return out
 
-    # 4) Verify barcode exists on page
-    out["barcode_matched_on_page"] = page_contains_barcode(driver, barcode)
-    out["status"] = "ok" if out["barcode_matched_on_page"] else "barcode_not_found_on_product_page"
+    # 4) Validate barcode against `.product.attribute.sku` before scraping
+    try:
+        wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, ".product.attribute.sku")))
+    except TimeoutException:
+        out["status"] = "sku_element_missing"
+        return out
+
+    out["barcode_matched_on_page"] = barcode_matches_sku_attribute(driver, barcode)
+    if not out["barcode_matched_on_page"]:
+        page_sku = get_page_sku(driver)
+        out["status"] = "sku_element_missing" if not page_sku else "sku_mismatch"
+        return out
+
+    out["status"] = "ok"
 
     # 5) Scrape title
     out["title"] = safe_text(driver, By.CSS_SELECTOR, '[data-ui-id="page-title-wrapper"]')
@@ -366,19 +399,32 @@ def scrape_one_barcode(driver: webdriver.Chrome, wait: WebDriverWait, barcode: s
 # MAIN
 # =========================
 def main():
-    inp_path = Path(INPUT_FOLDER) / INPUT_EXCEL
+    ap = argparse.ArgumentParser(description="Abdeen Center scraper by barcode/SKU")
+    ap.add_argument("--in", dest="inp", required=True, help="Input Excel or CSV file")
+    ap.add_argument("--out", required=True, help="Output Excel file")
+    ap.add_argument("--sku-col", dest="sku_col", default=None, help="Barcode/SKU column name (auto-detect if omitted)")
+    ap.add_argument("--headful", action="store_true", help="Show browser window")
+    args = ap.parse_args()
+
+    inp_path = Path(args.inp)
     if not inp_path.exists():
-        raise FileNotFoundError(f"Excel file not found: {inp_path.resolve()}")
+        raise FileNotFoundError(f"Input file not found: {inp_path.resolve()}")
 
-    df = pd.read_excel(inp_path)
-    barcode_col = pick_barcode_column(df)
+    ext = inp_path.suffix.lower()
+    if ext == ".csv":
+        df = pd.read_csv(inp_path)
+    elif ext in {".xls", ".xlsx", ".xlsm", ".xlsb", ".odf", ".ods", ".odt"}:
+        df = pd.read_excel(inp_path)
+    else:
+        raise ValueError(f"Unsupported input file type: {inp_path.name}")
 
-    # Ensure scraped columns exist (append to existing cols)
+    barcode_col = args.sku_col if (args.sku_col and args.sku_col in df.columns) else pick_barcode_column(df)
+
     for c in SCRAPED_COLUMNS:
         if c not in df.columns:
             df[c] = ""
 
-    driver = build_driver()
+    driver = build_driver(headful=args.headful)
     wait = WebDriverWait(driver, WAIT_SEC)
 
     try:
@@ -417,12 +463,7 @@ def main():
     finally:
         driver.quit()
 
-    # Save
-    if OUTPUT_EXCEL:
-        out_path = Path(INPUT_FOLDER) / OUTPUT_EXCEL
-    else:
-        out_path = inp_path  # overwrite same file (columns appended)
-
+    out_path = Path(args.out)
     df.to_excel(out_path, index=False)
     print(f"\nSaved: {out_path.resolve()} ({len(df)} rows)")
     print("Done.")

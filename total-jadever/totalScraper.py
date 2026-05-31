@@ -8,6 +8,7 @@ if sys.platform == 'win32':
     except Exception:
         pass
 
+import argparse
 import re
 import time
 from pathlib import Path
@@ -21,26 +22,20 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, StaleElementReferenceException, WebDriverException
 
-INPUT_FILE = r"total-jadever\Total 44N.xlsx"  # Excel file with barcodes (in same directory as script)
-BARCODE_COL = "BAR CODE"  # Column name containing barcodes (adjust if needed)
-HEADLESS = False 
-SLEEP = 0.25  # Wait for search results
-POST_SEARCH_DELAY = 1  # Extra delay after submitting search (tune if results are slow)
+SLEEP = 0.25
+POST_SEARCH_DELAY = 1
 TIMEOUT = 3
-PAGE_LOAD_WAIT = 0.5   # Wait after product page load
-BETWEEN_PRODUCTS_SLEEP = 0.1  # Pause between products
-TEST_MODE = False     # Test run: first 5 products
-TEST_LIMIT = 2
-OUTPUT_FILE = r"total-jadever\total_scraped_results_test.xlsx" if TEST_MODE else r"total-jadever\total_scraped_results.xlsx"
+PAGE_LOAD_WAIT = 0.5
+BETWEEN_PRODUCTS_SLEEP = 0.1
 # ============================
 
 HOME_URL = "https://www.total-jo.com/"
 
 
-def make_driver():
+def make_driver(headful: bool = False):
     """Create and configure Chrome driver"""
     opts = Options()
-    if HEADLESS:
+    if not headful:
         opts.add_argument("--headless=new")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
@@ -1065,23 +1060,25 @@ def scrape_product(driver, wait, barcode: str):
 
 def main():
     """Main execution function"""
-    input_path = Path(INPUT_FILE)
+    ap = argparse.ArgumentParser(description="Total JO scraper by barcode")
+    ap.add_argument("--in", dest="inp", required=True, help="Input Excel file")
+    ap.add_argument("--out", required=True, help="Output Excel file")
+    ap.add_argument("--sku-col", dest="sku_col", default=None, help="Barcode column name (auto-detect if omitted)")
+    ap.add_argument("--headful", action="store_true", help="Show browser window")
+    args = ap.parse_args()
+
+    input_path = Path(args.inp)
     if not input_path.exists():
-        excel_files = list(input_path.parent.glob("*.xlsx"))
-        if excel_files:
-            input_path = excel_files[0]
-            print(f"Using Excel file: {input_path}")
-        else:
-            print(f"Error: Input file not found: {str(INPUT_FILE)}")
-            return
-    
+        print(f"Error: Input file not found: {args.inp}")
+        return
+
     try:
         df = pd.read_excel(input_path)
     except Exception as e:
         print(f"Error reading Excel file: {e}")
         return
     barcode_col = None
-    possible_names = [BARCODE_COL, "BAR CODE", "Barcode", "BARCODE", "رقم الباركود", "باركود", "BARCODE", "Barcode"]
+    possible_names = [args.sku_col or "BAR CODE", "BAR CODE", "Barcode", "BARCODE", "رقم الباركود", "باركود", "Barcode"]
     for col in df.columns:
         col_str = str(col).strip()
         if col_str in possible_names or "باركود" in col_str or "barcode" in col_str.lower() or "bar code" in col_str.lower():
@@ -1097,9 +1094,9 @@ def main():
     if TEST_MODE:
         df = df.head(TEST_LIMIT).copy()
         print(f"TEST MODE: Processing only first {TEST_LIMIT} items")
-    driver = make_driver()
+    driver = make_driver(headful=args.headful)
     wait = WebDriverWait(driver, TIMEOUT)
-    
+
     results = []
     
     try:
@@ -1142,10 +1139,10 @@ def main():
         output_df = pd.concat([df, results_df], axis=1)
     if len(output_df) == 0:
         output_df = results_df
-    output_path = Path(OUTPUT_FILE)
+    output_path = Path(args.out)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_df.to_excel(output_path, index=False)
-    print(f"\nDone! Results saved to: {OUTPUT_FILE}")
+    print(f"\nDone! Results saved to: {args.out}")
 
 
 if __name__ == "__main__":

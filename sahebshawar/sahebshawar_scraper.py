@@ -8,6 +8,7 @@ and markdown-formatted descriptions. Results are written to
 """
 from __future__ import annotations
 
+import argparse
 import logging
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,8 +28,6 @@ except Exception:  # pragma: no cover - optional dependency
 logger = logging.getLogger(__name__)
 
 BASE_URL = "https://sahebshawar.com"
-INPUT_PATH = Path("sahebshawar") / "New products (Al Saheb and Shawar Al Tamimi) (2).xlsx"
-OUTPUT_PATH = Path("sahebshawar") / "sahebshawar_scraped.xlsx"
 REQUEST_TIMEOUT = 30
 
 HEADERS = {
@@ -202,16 +201,23 @@ def build_result_row(
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
-    if not INPUT_PATH.exists():
-        raise FileNotFoundError(f"Input file not found: {INPUT_PATH}")
+    ap = argparse.ArgumentParser(description="Saheb Shawar scraper by SKU")
+    ap.add_argument("--in", dest="inp", required=True, help="Input Excel file")
+    ap.add_argument("--out", required=True, help="Output Excel file")
+    ap.add_argument("--sku-col", dest="sku_col", default="Model", help="SKU column name (default: Model)")
+    args = ap.parse_args()
 
-    df = pd.read_excel(INPUT_PATH)
+    inp_path = Path(args.inp)
+    if not inp_path.exists():
+        raise FileNotFoundError(f"Input file not found: {inp_path}")
+
+    df = pd.read_excel(inp_path)
     scraper = SahebShawarScraper()
 
     results: List[Dict[str, str]] = []
 
     for _, row_data in iter_rows(df):
-        sku = row_data.get("Model", "").strip()
+        sku = row_data.get(args.sku_col, "").strip()
         if not sku:
             results.append(
                 build_result_row(
@@ -278,9 +284,10 @@ def main() -> None:
         results.append(build_result_row(row_data, record))
 
     output_df = pd.DataFrame(results)
-    OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    output_df.to_excel(OUTPUT_PATH, index=False)
-    logger.info("Saved %s rows to %s", len(output_df), OUTPUT_PATH)
+    out_path = Path(args.out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    output_df.to_excel(out_path, index=False)
+    logger.info("Saved %s rows to %s", len(output_df), out_path)
 
 
 if __name__ == "__main__":

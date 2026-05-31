@@ -421,6 +421,44 @@ def extract_description(driver) -> str:
         except Exception:
             pass
 
+        # STRICT FALLBACK: slice the page content from "Description" until "Recently Viewed".
+        # This avoids scraping footer widgets, info messages, and recently-viewed blocks.
+        try:
+            soup = BeautifulSoup(driver.page_source or "", "html.parser")
+
+            def _norm_heading(s: str) -> str:
+                return " ".join((s or "").strip().lower().split())
+
+            desc_header = soup.find(
+                lambda t: getattr(t, "name", None) in {"h1", "h2", "h3", "h4", "h5", "h6"}
+                and _norm_heading(t.get_text(" ", strip=True)) == "description"
+            )
+            if desc_header:
+                collected_lines: List[str] = []
+                seen_lines = set()
+                for el in desc_header.find_all_next():
+                    if getattr(el, "name", None) in {"h1", "h2", "h3", "h4", "h5", "h6"}:
+                        if _norm_heading(el.get_text(" ", strip=True)) == "recently viewed":
+                            break
+                    name = getattr(el, "name", None)
+                    if name not in {"p", "li", "h3", "h4"}:
+                        continue
+
+                    text = _clean_desc(el.get_text("\n", strip=True))
+                    if not text or len(text) <= 3:
+                        continue
+
+                    line = f"- {text}" if name == "li" else text
+                    if line not in seen_lines:
+                        seen_lines.add(line)
+                        collected_lines.append(line)
+
+                final = "\n".join(collected_lines).strip()
+                if final and len(final) > 20:
+                    return final
+        except Exception:
+            pass
+
         # Preferred: bashitihardware.com renders the real description body inside:
         # class="markdown prose w-full break-words dark:prose-invert dark"
         # The previous logic was too broad and could pull unrelated page text.
@@ -888,6 +926,12 @@ def main():
                 return
         elif not product_urls:
             print("❌ No product URLs to scrape")
+            if args.input_file and not args.sku_col:
+                print(
+                    "   Hint: URL mode only keeps rows whose cell starts with http:// or https:// . "
+                    'If your sheet has SKUs (e.g. column "Item No."), run with '
+                    '--sku-col "Item No." (or your exact header) to search then scrape.'
+                )
             return
         
         if not sku_mode:

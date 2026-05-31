@@ -17,6 +17,7 @@ if sys.platform == 'win32':
     except Exception:
         pass
 
+import argparse
 import re
 import time
 import random
@@ -33,8 +34,6 @@ from selenium.common.exceptions import TimeoutException
 
 # ------------------------- Config -------------------------
 SCRIPT_DIR = Path(__file__).resolve().parent
-INPUT_EXCEL = SCRIPT_DIR / "yato.xlsx"
-SKU_COL = "SKU"  # Override or auto-detect if not present
 SEARCH_URL = "https://www.inserv.lv/en/products/search?q={sku}"
 BASE_URL = "https://www.inserv.lv"
 HEADLESS = False
@@ -48,9 +47,8 @@ BETWEEN_PRODUCTS_MIN = 3.0
 BETWEEN_PRODUCTS_MAX = 6.0
 BETWEEN_CLICK_MIN = 0.8
 BETWEEN_CLICK_MAX = 2.0
-TEST_MODE = False   # Set to False for full run
+TEST_MODE = False
 TEST_LIMIT = 5
-OUTPUT_EXCEL = SCRIPT_DIR / "inserv_scraped_test.xlsx" if TEST_MODE else SCRIPT_DIR / "inserv_scraped.xlsx"
 # Realistic Chrome User-Agent (update version if needed)
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -59,13 +57,13 @@ USER_AGENT = (
 # -------------------------
 
 
-def make_driver():
+def make_driver(headful: bool = False):
     """Create Chrome driver. Prefer undetected_chromedriver to avoid access denied."""
     if USE_UNDETECTED:
         try:
             import undetected_chromedriver as uc
             opts = uc.ChromeOptions()
-            if HEADLESS:
+            if not headful:
                 opts.add_argument("--headless=new")
             opts.add_argument("--no-sandbox")
             opts.add_argument("--disable-dev-shm-usage")
@@ -80,7 +78,7 @@ def make_driver():
             print(f"Note: undetected_chromedriver failed ({e}). Using standard Chrome.")
 
     opts = Options()
-    if HEADLESS:
+    if not headful:
         opts.add_argument("--headless=new")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
@@ -166,9 +164,9 @@ def close_overlays(driver):
             continue
 
 
-def find_sku_column(df: pd.DataFrame) -> str:
-    if SKU_COL and str(SKU_COL).strip() in df.columns:
-        return SKU_COL
+def find_sku_column(df: pd.DataFrame, hint: str = "") -> str:
+    if hint and hint.strip() in df.columns:
+        return hint.strip()
     for c in df.columns:
         if "sku" in str(c).lower():
             return c
@@ -327,7 +325,14 @@ def scrape_product(driver, wait, sku: str) -> dict:
 
 
 def main():
-    input_path = Path(INPUT_EXCEL)
+    ap = argparse.ArgumentParser(description="Inserv.lv SKU scraper")
+    ap.add_argument("--in", dest="inp", required=True, help="Input Excel file")
+    ap.add_argument("--out", required=True, help="Output Excel file")
+    ap.add_argument("--sku-col", dest="sku_col", default="", help="SKU column name (auto-detect if omitted)")
+    ap.add_argument("--headful", action="store_true", help="Show browser window")
+    args = ap.parse_args()
+
+    input_path = Path(args.inp)
     if not input_path.exists():
         print(f"Error: Input file not found: {input_path}")
         return
@@ -342,14 +347,14 @@ def main():
         print("Error: Excel file is empty.")
         return
 
-    sku_col = find_sku_column(df)
+    sku_col = find_sku_column(df, hint=args.sku_col)
     print(f"Using SKU column: '{sku_col}'")
 
     if TEST_MODE:
         df = df.head(TEST_LIMIT).copy()
         print(f"TEST MODE: Processing only first {TEST_LIMIT} items")
 
-    driver = make_driver()
+    driver = make_driver(headful=args.headful)
     wait = WebDriverWait(driver, TIMEOUT)
     results = []
 
@@ -390,7 +395,7 @@ def main():
     if len(output_df) == 0:
         output_df = results_df
 
-    output_path = Path(OUTPUT_EXCEL)
+    output_path = Path(args.out)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_df.to_excel(output_path, index=False, engine="openpyxl")
     print(f"\nDone! Results saved to: {output_path}")
