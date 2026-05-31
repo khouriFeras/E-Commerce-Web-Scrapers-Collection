@@ -27,6 +27,8 @@ POST_SEARCH_DELAY = 1
 TIMEOUT = 3
 PAGE_LOAD_WAIT = 0.5
 BETWEEN_PRODUCTS_SLEEP = 0.1
+TEST_MODE = False
+TEST_LIMIT = 5
 # ============================
 
 HOME_URL = "https://www.total-jo.com/"
