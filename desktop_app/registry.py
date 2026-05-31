@@ -140,7 +140,7 @@ SCRAPERS = [
         "script": "bashitihardware/bashitihardware_scraper.py",
         "in_flag": "--in",
         "sku_flag": "--sku-col",
-        "out_flag": None,
+        "out_flag": "--out",
         "headful_mode": "inverted",
         "description": "Scrapes product data from Bashiti Hardware website",
     },
