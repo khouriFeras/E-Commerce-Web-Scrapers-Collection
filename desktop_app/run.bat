@@ -11,8 +11,11 @@ if exist "scraper_env\Scripts\python.exe" (
     set PYTHON=python
 )
 
-:: Install Flask if not already installed
-%PYTHON% -m pip show flask >nul 2>&1 || %PYTHON% -m pip install flask pandas openpyxl
+:: Install all dependencies
+%PYTHON% -m pip install -r desktop_app\requirements.txt
+
+:: Install Playwright browsers (needed for the suppliers scraper)
+%PYTHON% -m playwright install chromium
 
 echo.
 echo  Starting JafarShop Scraper Launcher...
