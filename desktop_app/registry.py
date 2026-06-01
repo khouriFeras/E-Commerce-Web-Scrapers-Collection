@@ -93,6 +93,16 @@ SCRAPERS = [
         "description": "Scrapes Anker global store by SKU (requests-based)",
     },
     {
+        "id": "smartbuy",
+        "name": "SmartBuy ME",
+        "script": "smartBuy/smartbuy_scraper.py",
+        "in_flag": "--in",
+        "sku_flag": None,
+        "out_flag": "--out",
+        "headful_mode": "flag",
+        "description": "Scrapes images & description from smartbuy-me.com by barcode (SKU verified)",
+    },
+    {
         "id": "xiaomi_africa",
         "name": "Xiaomi MiStore Africa",
         "script": "xiaomiAfrica/mistore_scraper.py",
