@@ -407,9 +407,13 @@ def main() -> None:
     if not input_path.exists():
         raise FileNotFoundError(f"Input file not found: {input_path}")
 
-    df = pd.read_excel(input_path)
+    # Group B resume: read from output if it exists, else from input
+    data_path = output_path if output_path.exists() else input_path
+    df = pd.read_excel(data_path)
     code_col = pick_code_column(df)
     print(f"Using code column: {code_col}")
+    if data_path == output_path:
+        print(f"Resuming from existing output: {output_path}")
 
     if "imgs" not in df.columns:
         df["imgs"] = ""
@@ -423,6 +427,11 @@ def main() -> None:
         print(f"Rows to process: {total}")
         for idx in range(total):
             item_code = df.at[idx, code_col]
+            # Skip rows that already have images
+            existing_imgs = str(df.at[idx, "imgs"]).strip()
+            if existing_imgs not in ("", "nan"):
+                print(f"[{idx + 1}/{total}] Skipping already-done code={item_code}")
+                continue
             print(f"[{idx + 1}/{total}] searching code={item_code}")
             result = scrape_one_item(driver, wait, str(item_code), max_images=args.max_images)
 

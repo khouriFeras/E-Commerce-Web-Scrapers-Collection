@@ -468,19 +468,33 @@ def main():
     ap.add_argument("--headful", action="store_true", help="Show browser window")
     args = ap.parse_args()
 
-    df = pd.read_excel(args.inp)
+    # Group B resume: read from output if it exists, else from input
+    out_path = Path(args.out)
+    data_path = out_path if out_path.exists() else Path(args.inp)
+    df = pd.read_excel(data_path)
     if args.sku_col not in df.columns:
         raise SystemExit(f"Column '{args.sku_col}' not found. Available: {list(df.columns)}")
+    if data_path == out_path:
+        print(f"Resuming from existing output: {out_path}")
+
+    # Ensure description column exists
+    if "description" not in df.columns:
+        df["description"] = ""
 
     driver = make_driver(headful=args.headful)
     wait = WebDriverWait(driver, TIMEOUT)
-    out_desc = []
 
     try:
         for i, row in df.iterrows():
             sku = str(row.get(args.sku_col, "")).strip()
             if not sku:
-                out_desc.append(""); continue
+                continue
+
+            # Skip rows where description is already populated
+            existing_desc = str(df.at[i, "description"]).strip()
+            if existing_desc not in ("", "nan"):
+                print(f"[{i}] {sku}: skipping already-done")
+                continue
 
             try:
                 opened = open_product_by_clicking_search(driver, wait, sku)
@@ -492,7 +506,7 @@ def main():
 
             if not opened:
                 print(f"[{i}] {sku}: NOT FOUND via search click")
-                out_desc.append(""); continue
+                continue
 
             time.sleep(SLEEP)
             desc = ""
@@ -503,16 +517,14 @@ def main():
                 desc = ""
 
             print(f"[{i}] {sku}: {'OK' if desc else 'EMPTY'}")
-            out_desc.append(desc)
+            df.at[i, "description"] = desc
             time.sleep(SLEEP)
     finally:
         try: driver.quit()
         except Exception: pass
 
-    df = df.copy()
-    df["description"] = out_desc
-    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-    df.to_excel(args.out, index=False)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_excel(out_path, index=False)
     print(f"Saved {args.out}")
 
 

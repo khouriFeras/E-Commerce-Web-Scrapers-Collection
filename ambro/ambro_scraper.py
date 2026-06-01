@@ -216,7 +216,11 @@ def main():
     if not input_path.exists():
         raise FileNotFoundError(f"Input not found: {input_path}")
 
-    df = pd.read_excel(input_path)
+    # Group B resume: read from output if it exists, else from input
+    data_path = output_path if output_path.exists() else input_path
+    df = pd.read_excel(data_path)
+    if data_path == output_path:
+        print(f"Resuming from existing output: {output_path.name}")
     if args.limit > 0:
         df = df.head(args.limit).copy()
 
@@ -224,7 +228,7 @@ def main():
         if col not in df.columns:
             df[col] = ""
 
-    print(f"Loaded {len(df)} rows from {input_path.name}")
+    print(f"Loaded {len(df)} rows from {data_path.name}")
     print(f"Output will be written to {output_path.name}")
 
     session = requests.Session()
@@ -237,6 +241,12 @@ def main():
         code = clean(row.get("Code", ""))
         if not code:
             df.at[idx, "Status"] = "empty_code"
+            continue
+
+        # Skip rows that were already successfully scraped
+        existing_status = str(df.at[idx, "Status"]).strip()
+        if existing_status.startswith("ok"):
+            print(f"[{i}/{total}] {code:<14} skipping already-done")
             continue
 
         res = scrape_code(session, code)

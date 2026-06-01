@@ -355,65 +355,68 @@ def main():
         print(f"Error: Input file not found: {args.inp}")
         return
 
-    print(f"Reading SKUs from: {args.inp}")
-    df = pd.read_excel(input_path)
+    # Group B resume: read from output if it exists, else from input
+    output_path = Path(args.out)
+    data_path = output_path if output_path.exists() else input_path
+    print(f"Reading SKUs from: {data_path}")
+    df = pd.read_excel(data_path)
 
     if args.sku_col not in df.columns:
         print(f"Error: Column '{args.sku_col}' not found. Available columns: {list(df.columns)}")
         return
+    if data_path == output_path:
+        print(f"Resuming from existing output: {output_path}")
+
+    # Ensure output columns exist
+    for col in ("title", "description", "images"):
+        if col not in df.columns:
+            df[col] = ""
 
     driver = make_driver(headful=args.headful)
     wait = WebDriverWait(driver, TIMEOUT)
-    
-    titles = []
-    descriptions = []
-    images_list = []
-    
+
     try:
         total = len(df)
         for idx, row in df.iterrows():
             sku = str(row.get(args.sku_col, "")).strip()
-            
+
             if not sku or sku.lower() in {"nan", "none", ""}:
                 print(f"[{idx + 1}/{total}] Empty SKU, skipping")
-                titles.append("")
-                descriptions.append("")
-                images_list.append("")
                 continue
-            
+
+            # Skip rows where description is already populated
+            existing_desc = str(df.at[idx, "description"]).strip()
+            if existing_desc not in ("", "nan"):
+                print(f"[{idx + 1}/{total}] Skipping already-done SKU: {sku}")
+                continue
+
             print(f"\n[{idx + 1}/{total}] Processing SKU: {sku}")
             title, desc, images = scrape_product(driver, wait, sku)
-            titles.append(title)
-            descriptions.append(desc)
-            
+
             # Join images with comma separator
             images_str = ", ".join(images) if images else ""
-            images_list.append(images_str)
-            
+
+            df.at[idx, "title"] = title
+            df.at[idx, "description"] = desc
+            df.at[idx, "images"] = images_str
+
             if desc:
-                print(f"  ✓ Success: {len(desc)} characters extracted, {len(images)} images")
+                print(f"  Success: {len(desc)} characters extracted, {len(images)} images")
             else:
-                print(f"  ✗ No description found, {len(images)} images")
-            
+                print(f"  No description found, {len(images)} images")
+
             time.sleep(SLEEP)
-    
+
     finally:
         driver.quit()
-    
-    # Save results
-    df = df.copy()
-    df["title"] = titles
-    df["description"] = descriptions
-    df["images"] = images_list
-    
-    output_path = Path(args.out)
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
     df.to_excel(output_path, index=False)
-    print(f"\n✓ Done! Saved to: {args.out}")
-    print(f"  Total rows processed: {total}")
-    print(f"  Titles found: {sum(1 for t in titles if t)}")
-    print(f"  Descriptions found: {sum(1 for d in descriptions if d)}")
-    print(f"  Images found: {sum(1 for imgs in images_list if imgs)}")
+    print(f"\nDone! Saved to: {args.out}")
+    print(f"  Total rows: {total}")
+    print(f"  Titles found: {sum(1 for t in df['title'] if str(t).strip() not in ('', 'nan'))}")
+    print(f"  Descriptions found: {sum(1 for d in df['description'] if str(d).strip() not in ('', 'nan'))}")
+    print(f"  Images found: {sum(1 for imgs in df['images'] if str(imgs).strip() not in ('', 'nan'))}")
 
 
 if __name__ == "__main__":

@@ -405,9 +405,13 @@ def main() -> None:
     if not input_path.exists():
         raise FileNotFoundError(f"Input file not found: {input_path}")
 
-    df = pd.read_excel(input_path)
+    # Group B resume: read from output if it exists, else from input
+    data_path = output_path if output_path.exists() else input_path
+    df = pd.read_excel(data_path)
     sku_col = pick_sku_column(df)
     print(f"Using SKU column: {sku_col}")
+    if data_path == output_path:
+        print(f"Resuming from existing output: {output_path}")
 
     if "imgs" not in df.columns:
         df["imgs"] = ""
@@ -421,6 +425,11 @@ def main() -> None:
         print(f"Rows to process: {total}")
         for idx in range(total):
             sku = str(df.at[idx, sku_col])
+            # Skip rows that already have images
+            existing_imgs = str(df.at[idx, "imgs"]).strip()
+            if existing_imgs not in ("", "nan"):
+                print(f"[{idx + 1}/{total}] Skipping already-done sku={sku}")
+                continue
             print(f"[{idx + 1}/{total}] sku={sku}")
             try:
                 scraped = scrape_images_from_first_result(driver, wait, sku)

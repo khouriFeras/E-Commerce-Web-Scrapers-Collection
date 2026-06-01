@@ -419,7 +419,12 @@ def main():
     ap.add_argument("--timeout-ms", type=int, default=20000, help="Default timeout (ms).")
     args = ap.parse_args()
 
-    df, sku_col = read_input_excel(args.input, args.sku_col)
+    # Group B resume: read from output if it exists, else from input
+    if os.path.exists(args.output):
+        print(f"Resuming from existing output: {args.output}")
+        df, sku_col = read_input_excel(args.output, args.sku_col)
+    else:
+        df, sku_col = read_input_excel(args.input, args.sku_col)
     df = ensure_output_cols(df)
 
     processed_count = 0
@@ -447,6 +452,11 @@ def main():
             sku = (row.get(sku_col) or "").strip()
             if not sku:
                 df.at[idx, "status"] = "skipped_empty_sku"
+                continue
+
+            # Skip rows already successfully scraped
+            if str(df.at[idx, "status"]).strip() == "found":
+                print(f"Skipping already-done SKU: {sku}")
                 continue
 
             if args.limit is not None and processed_count >= args.limit:

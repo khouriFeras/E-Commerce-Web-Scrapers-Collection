@@ -354,6 +354,22 @@ def main():
         df = df.head(TEST_LIMIT).copy()
         print(f"TEST MODE: Processing only first {TEST_LIMIT} items")
 
+    # Resume logic: load existing output and skip already-done SKUs
+    output_path = Path(args.out)
+    existing_df = None
+    already_done_skus: set = set()
+    if output_path.exists():
+        try:
+            existing_df = pd.read_excel(output_path, engine="openpyxl")
+            if "SKU" in existing_df.columns and "Status" in existing_df.columns:
+                already_done_skus = set(
+                    existing_df.loc[existing_df["Status"] == "SUCCESS", "SKU"].astype(str).str.strip()
+                )
+            print(f"Resuming: {len(already_done_skus)} SKUs already done, will skip them")
+        except Exception as e:
+            print(f"Warning: could not read existing output ({e}), starting fresh")
+            existing_df = None
+
     driver = make_driver(headful=args.headful)
     wait = WebDriverWait(driver, TIMEOUT)
     results = []
@@ -374,6 +390,9 @@ def main():
                 print(f"[{idx}/{total}] Skipping empty SKU")
                 results.append({"SKU": sku, "Images": "", "Description": "", "Status": "EMPTY_SKU"})
                 continue
+            if sku in already_done_skus:
+                print(f"[{idx}/{total}] Skipping already-done SKU: {sku}")
+                continue
             print(f"[{idx}/{total}] Processing SKU: {sku}")
             result = scrape_product(driver, wait, sku)
             results.append(result)
@@ -382,22 +401,26 @@ def main():
     finally:
         driver.quit()
 
-    results_df = pd.DataFrame(results)
-    try:
-        output_df = df.merge(results_df, left_on=sku_col, right_on="SKU", how="left", suffixes=("", "_scraped"))
-        # Keep one key column: if original had different name, drop the right-side "SKU"
-        if "SKU_scraped" in output_df.columns:
-            output_df = output_df.drop(columns=["SKU_scraped"])
-        if sku_col != "SKU" and "SKU" in output_df.columns:
-            output_df = output_df.drop(columns=["SKU"], errors="ignore")
-    except Exception:
-        output_df = pd.concat([df, results_df], axis=1)
-    if len(output_df) == 0:
-        output_df = results_df
+    new_results_df = pd.DataFrame(results)
+    if existing_df is not None and len(new_results_df) > 0:
+        final_df = pd.concat([existing_df, new_results_df], ignore_index=True)
+    elif existing_df is not None:
+        final_df = existing_df
+    else:
+        # First run: merge with input df
+        try:
+            final_df = df.merge(new_results_df, left_on=sku_col, right_on="SKU", how="left", suffixes=("", "_scraped"))
+            if "SKU_scraped" in final_df.columns:
+                final_df = final_df.drop(columns=["SKU_scraped"])
+            if sku_col != "SKU" and "SKU" in final_df.columns:
+                final_df = final_df.drop(columns=["SKU"], errors="ignore")
+        except Exception:
+            final_df = pd.concat([df, new_results_df], axis=1)
+        if len(final_df) == 0:
+            final_df = new_results_df
 
-    output_path = Path(args.out)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_df.to_excel(output_path, index=False, engine="openpyxl")
+    final_df.to_excel(output_path, index=False, engine="openpyxl")
     print(f"\nDone! Results saved to: {output_path}")
 
 

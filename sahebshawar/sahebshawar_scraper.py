@@ -214,10 +214,29 @@ def main() -> None:
     df = pd.read_excel(inp_path)
     scraper = SahebShawarScraper()
 
+    # Resume logic: load existing output and skip already-done SKUs
+    out_path = Path(args.out)
+    existing_df = None
+    already_done_skus: set = set()
+    if out_path.exists():
+        try:
+            existing_df = pd.read_excel(out_path)
+            if "Model" in existing_df.columns and "Status" in existing_df.columns:
+                already_done_skus = set(
+                    existing_df.loc[existing_df["Status"] == "ok", "Model"].astype(str).str.strip()
+                )
+            logger.info("Resuming: %d SKUs already done, will skip them", len(already_done_skus))
+        except Exception as exc:
+            logger.warning("Could not read existing output (%s), starting fresh", exc)
+            existing_df = None
+
     results: List[Dict[str, str]] = []
 
     for _, row_data in iter_rows(df):
         sku = row_data.get(args.sku_col, "").strip()
+        if sku and sku in already_done_skus:
+            logger.info("Skipping already-done SKU %s", sku)
+            continue
         if not sku:
             results.append(
                 build_result_row(
@@ -283,11 +302,16 @@ def main() -> None:
 
         results.append(build_result_row(row_data, record))
 
-    output_df = pd.DataFrame(results)
-    out_path = Path(args.out)
+    new_output_df = pd.DataFrame(results)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    output_df.to_excel(out_path, index=False)
-    logger.info("Saved %s rows to %s", len(output_df), out_path)
+    if existing_df is not None and len(new_output_df) > 0:
+        final_df = pd.concat([existing_df, new_output_df], ignore_index=True)
+    elif existing_df is not None:
+        final_df = existing_df
+    else:
+        final_df = new_output_df
+    final_df.to_excel(out_path, index=False)
+    logger.info("Saved %s rows to %s", len(final_df), out_path)
 
 
 if __name__ == "__main__":

@@ -163,6 +163,25 @@ def run_scraper(
     session = requests.Session()
     session.headers.update(HEADERS)
 
+    # Resume logic: load existing output and collect already-done Product URLs
+    existing_df = None
+    already_done_urls: Set[str] = set()
+    if out_path.exists():
+        try:
+            existing_df = pd.read_excel(out_path)
+            if "Product URL" in existing_df.columns and "Status" in existing_df.columns:
+                already_done_urls = set(
+                    existing_df.loc[
+                        existing_df["Status"].astype(str).str.strip().ne("skipped_oos")
+                        & existing_df["Status"].astype(str).str.strip().ne(""),
+                        "Product URL",
+                    ].astype(str).str.strip()
+                )
+            logger.info("Resuming: %d Product URLs already done, will skip them", len(already_done_urls))
+        except Exception as exc:
+            logger.warning("Could not read existing output (%s), starting fresh", exc)
+            existing_df = None
+
     seen_urls: Set[str] = set()
     rows: List[Dict[str, object]] = []
 
@@ -217,6 +236,9 @@ def run_scraper(
             if product_url in seen_urls:
                 continue
             seen_urls.add(product_url)
+            if product_url in already_done_urls:
+                logger.info("Skipping already-done URL: %s", product_url)
+                continue
 
             time.sleep(pause)
             title, price, description, images, st = scrape_product_page(session, product_url)
@@ -235,10 +257,16 @@ def run_scraper(
 
         page_num += 1
 
-    df = pd.DataFrame(rows)
+    new_output_df = pd.DataFrame(rows)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    df.to_excel(out_path, index=False)
-    logger.info("Wrote %s rows to %s", len(df), out_path)
+    if existing_df is not None and len(new_output_df) > 0:
+        final_df = pd.concat([existing_df, new_output_df], ignore_index=True)
+    elif existing_df is not None:
+        final_df = existing_df
+    else:
+        final_df = new_output_df
+    final_df.to_excel(out_path, index=False)
+    logger.info("Wrote %s rows to %s", len(final_df), out_path)
 
 
 def main() -> None:

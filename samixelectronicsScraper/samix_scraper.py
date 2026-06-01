@@ -602,12 +602,27 @@ def main():
     
     print(f" Found {len(snk_refs)} SNK Ref entries")
     print(f" Starting from row {args.start_row}")
-    
+
+    # Resume logic: load existing output and skip already-done SNK Refs
+    existing_df = None
+    already_done_refs: set = set()
+    if os.path.exists(args.output):
+        try:
+            existing_df = pd.read_excel(args.output)
+            if "SNK Ref" in existing_df.columns and "Status" in existing_df.columns:
+                already_done_refs = set(
+                    existing_df.loc[existing_df["Status"] == "SUCCESS", "SNK Ref"].astype(str).str.strip()
+                )
+            print(f" Resuming: {len(already_done_refs)} SNK Refs already done, will skip them")
+        except Exception as e:
+            print(f" Warning: could not read existing output ({e}), starting fresh")
+            existing_df = None
+
     # Setup driver
     print(" Starting browser...")
     driver = build_driver(headful=args.headful)
     wait = WebDriverWait(driver, 20)
-    
+
     results = []
     
     try:
@@ -618,6 +633,9 @@ def main():
         total_to_process = len(snk_refs_to_process)
         
         for idx, snk_ref in enumerate(snk_refs_to_process, start=start_idx):
+            if snk_ref in already_done_refs:
+                print(f"\n[{idx + 1 - start_idx}/{total_to_process}] Skipping already-done: {snk_ref}")
+                continue
             print(f"\n[{idx + 1 - start_idx}/{total_to_process}] Processing: {snk_ref}")
             
             result = scrape_snk_ref(driver, wait, snk_ref, args.pause)
@@ -634,9 +652,15 @@ def main():
             time.sleep(args.pause)
         
         # Save final results
-        print(f"\n💾 Saving results to: {args.output}")
-        results_df = pd.DataFrame(results)
-        results_df.to_excel(args.output, index=False)
+        print(f"\n Saving results to: {args.output}")
+        new_output_df = pd.DataFrame(results)
+        if existing_df is not None and len(new_output_df) > 0:
+            final_df = pd.concat([existing_df, new_output_df], ignore_index=True)
+        elif existing_df is not None:
+            final_df = existing_df
+        else:
+            final_df = new_output_df
+        final_df.to_excel(args.output, index=False)
         
         # Print summary
         success = sum(1 for r in results if r["Status"] == "SUCCESS")

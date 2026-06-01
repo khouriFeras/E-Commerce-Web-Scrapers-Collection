@@ -437,11 +437,29 @@ def main() -> None:
 
     ensure_parent_dir(args.out)
 
+    # Resume logic: load existing output and skip already-done product URLs
+    existing_df = None
+    already_done_urls: set = set()
+    if os.path.exists(args.out):
+        try:
+            existing_df = pd.read_excel(args.out)
+            if "product_url" in existing_df.columns and "status" in existing_df.columns:
+                already_done_urls = set(
+                    existing_df.loc[existing_df["status"] == "SUCCESS", "product_url"].astype(str).str.strip()
+                )
+            print(f"Resuming: {len(already_done_urls)} URLs already done, will skip them")
+        except Exception as e:
+            print(f"Warning: could not read existing output ({e}), starting fresh")
+            existing_df = None
+
     driver = build_driver(headful=args.headful)
     rows = []
 
     try:
         for i, url in enumerate(links, 1):
+            if url in already_done_urls:
+                print(f"[{i}/{len(links)}] Skipping already-done: {url}")
+                continue
             print(f"[{i}/{len(links)}] {url}")
             try:
                 res = scrape_product(driver, url)
@@ -473,9 +491,15 @@ def main() -> None:
     finally:
         driver.quit()
 
-    df = pd.DataFrame(rows)
-    df.to_excel(args.out, index=False)
-    print(f"Saved: {args.out} ({len(df)} rows)")
+    new_output_df = pd.DataFrame(rows)
+    if existing_df is not None and len(new_output_df) > 0:
+        final_df = pd.concat([existing_df, new_output_df], ignore_index=True)
+    elif existing_df is not None:
+        final_df = existing_df
+    else:
+        final_df = new_output_df
+    final_df.to_excel(args.out, index=False)
+    print(f"Saved: {args.out} ({len(final_df)} rows)")
 
 
 if __name__ == "__main__":

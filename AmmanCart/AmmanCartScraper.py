@@ -736,15 +736,31 @@ def main():
     
     skus = df[sku_col].fillna("").astype(str).tolist()
     skus = [s.strip() for s in skus if s.strip()]
-    
+
     # Apply limit if specified
     if args.limit:
         skus = skus[:args.limit]
         print(f" TEST MODE: Limited to {args.limit} products")
-    
+
     print(f" Found {len(skus)} SKU entries")
     print(f" Starting from row {args.start_row}")
-    
+
+    # Resume logic: load existing output and skip already-done SKUs
+    output_path = os.path.join(os.path.dirname(__file__), args.output)
+    existing_df = None
+    already_done_skus = set()
+    if os.path.exists(output_path):
+        try:
+            existing_df = pd.read_excel(output_path)
+            if "SKU" in existing_df.columns and "Status" in existing_df.columns:
+                already_done_skus = set(
+                    existing_df.loc[existing_df["Status"] != "FAILED", "SKU"].astype(str).str.strip()
+                )
+            print(f" Resuming: {len(already_done_skus)} SKUs already done, will skip them")
+        except Exception as e:
+            print(f" Warning: could not read existing output ({e}), starting fresh")
+            existing_df = None
+
     # Setup driver
     print(" Starting browser...")
     driver = build_driver(headful=args.headful)
@@ -760,8 +776,11 @@ def main():
         total_to_process = len(skus_to_process)
         
         for idx, sku in enumerate(skus_to_process, start=start_idx):
+            if sku in already_done_skus:
+                print(f"\n[{idx + 1 - start_idx}/{total_to_process}] Skipping already-done SKU: {sku}")
+                continue
             print(f"\n[{idx + 1 - start_idx}/{total_to_process}] Processing SKU: {sku}")
-            
+
             result = scrape_sku(driver, wait, sku, args.pause)
             results.append(result)
             
@@ -776,10 +795,15 @@ def main():
             time.sleep(args.pause)
         
         # Save final results
-        output_path = os.path.join(os.path.dirname(__file__), args.output)
-        print(f"\n💾 Saving results to: {output_path}")
-        results_df = pd.DataFrame(results)
-        results_df.to_excel(output_path, index=False)
+        print(f"\n Saving results to: {output_path}")
+        new_output_df = pd.DataFrame(results)
+        if existing_df is not None and len(new_output_df) > 0:
+            final_df = pd.concat([existing_df, new_output_df], ignore_index=True)
+        elif existing_df is not None:
+            final_df = existing_df
+        else:
+            final_df = new_output_df
+        final_df.to_excel(output_path, index=False)
         
         # Print summary
         success = sum(1 for r in results if r["Status"] == "SUCCESS")

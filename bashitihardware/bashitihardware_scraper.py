@@ -845,7 +845,25 @@ def main():
     output_dir = os.path.dirname(args.output_file)
     if output_dir and not os.path.exists(output_dir):
         os.makedirs(output_dir)
-    
+
+    # Resume logic: load existing output and collect already-done QuerySKUs
+    existing_df = None
+    already_done_skus: set = set()
+    if os.path.exists(args.output_file):
+        try:
+            existing_df = pd.read_excel(args.output_file)
+            if "QuerySKU" in existing_df.columns and "Found" in existing_df.columns:
+                already_done_skus = set(
+                    existing_df.loc[existing_df["Found"] == True, "QuerySKU"].astype(str).str.strip()
+                )
+            elif "QuerySKU" in existing_df.columns:
+                # fallback: use status-like column if present
+                pass
+            print(f"Resuming: {len(already_done_skus)} SKUs already done, will skip them")
+        except Exception as e:
+            print(f"Warning: could not read existing output ({e}), starting fresh")
+            existing_df = None
+
     # Build driver
     driver = build_driver(headless=args.headless)
     wait = WebDriverWait(driver, 20)
@@ -958,6 +976,9 @@ def main():
 
         if sku_mode:
             for idx, qsku in enumerate(sku_list, 1):
+                if str(qsku).strip() in already_done_skus:
+                    print(f"\n[{idx}/{total}] Skipping already-done SKU: {qsku}")
+                    continue
                 print(f"\n[{idx}/{total}] SKU: {qsku}")
                 try:
                     result = scrape_from_sku_search(driver, qsku, wait, args.pause, args.max_img)
@@ -1026,15 +1047,22 @@ def main():
                 time.sleep(args.pause)
         
         # Create results DataFrame
-        results_df = pd.DataFrame(results)
-        
+        new_results_df = pd.DataFrame(results)
+
         # Convert Images list to semicolon-separated string
-        results_df["Images"] = results_df["Images"].apply(
-            lambda lst: ";".join(lst) if isinstance(lst, list) and lst else ""
-        )
-        
-        # Save results
-        results_df.to_excel(args.output_file, index=False)
+        if len(new_results_df) > 0:
+            new_results_df["Images"] = new_results_df["Images"].apply(
+                lambda lst: ";".join(lst) if isinstance(lst, list) and lst else ""
+            )
+
+        # Save results (append to existing)
+        if existing_df is not None and len(new_results_df) > 0:
+            final_df = pd.concat([existing_df, new_results_df], ignore_index=True)
+        elif existing_df is not None:
+            final_df = existing_df
+        else:
+            final_df = new_results_df
+        final_df.to_excel(args.output_file, index=False)
         
         # Print summary
         found_count = sum(1 for result in results if result.get("Found", False))

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import time
 import re
 from collections import OrderedDict
@@ -415,10 +416,28 @@ def run(inp: str, out: str, sku_col: Optional[str] = None) -> None:
     if not sku_col:
         raise SystemExit("Input Excel must have a 'SKU' or 'Model' column (or pass --sku-col).")
 
+    # Resume logic: load existing output and skip already-done SKUs
+    existing_df = None
+    already_done_skus: set = set()
+    if os.path.exists(out):
+        try:
+            existing_df = pd.read_excel(out)
+            if "SKU" in existing_df.columns and "Status" in existing_df.columns:
+                already_done_skus = set(
+                    existing_df.loc[existing_df["Status"] == "ok", "SKU"].astype(str).str.strip()
+                )
+            logging.info("Resuming: %d SKUs already done, will skip them", len(already_done_skus))
+        except Exception as exc:
+            logging.warning("Could not read existing output (%s), starting fresh", exc)
+            existing_df = None
+
     results: List[dict] = []
     for sku_value in source_df[sku_col]:
         sku = str(sku_value).strip()
         if not sku or sku.lower() == "nan":
+            continue
+        if sku in already_done_skus:
+            logging.info("Skipping already-done SKU %s", sku)
             continue
         logging.info("Processing SKU %s", sku)
         result = ProductResult(sku=sku)
@@ -444,8 +463,14 @@ def run(inp: str, out: str, sku_col: Optional[str] = None) -> None:
         results.append(result.as_dict())
         time.sleep(SLEEP_SECONDS)
 
-    output_df = pd.DataFrame(results)
-    output_df.to_excel(out, index=False)
+    new_output_df = pd.DataFrame(results)
+    if existing_df is not None and len(new_output_df) > 0:
+        final_df = pd.concat([existing_df, new_output_df], ignore_index=True)
+    elif existing_df is not None:
+        final_df = existing_df
+    else:
+        final_df = new_output_df
+    final_df.to_excel(out, index=False)
     logging.info("Saved results to %s", out)
 
 

@@ -409,6 +409,22 @@ def scrape_products_by_skus(
     delay: float = 1.5,
 ) -> None:
     """Scrape products by SKU using the site's search page."""
+
+    # Resume logic: load existing output and skip already-done URLs
+    existing_df = None
+    already_done_urls: set = set()
+    if os.path.exists(output_file):
+        try:
+            existing_df = pd.read_excel(output_file)
+            if "url" in existing_df.columns and "status" in existing_df.columns:
+                already_done_urls = set(
+                    existing_df.loc[existing_df["status"] == "SUCCESS", "url"].astype(str).str.strip()
+                )
+            print(f"Resuming: {len(already_done_urls)} URLs already done, will skip them")
+        except Exception as e:
+            print(f"Warning: could not read existing output ({e}), starting fresh")
+            existing_df = None
+
     driver = build_driver(headful)
     try:
         print("Starting New Vision SKU Search Scraper")
@@ -432,6 +448,13 @@ def scrape_products_by_skus(
             except TimeoutException:
                 pass
             time.sleep(1.0)
+
+            # Skip if this URL was already successfully scraped
+            if driver.current_url in already_done_urls:
+                print(f"   Skipping already-done URL: {driver.current_url[:60]}")
+                if i < len(skus):
+                    time.sleep(delay)
+                continue
 
             # Step 1: validate SKU on the page. If it doesn't validate, skip scraping.
             page_sku = _get_page_sku(driver)
@@ -486,38 +509,45 @@ def scrape_products_by_skus(
             if i < len(skus):
                 time.sleep(delay)
 
-        df = pd.DataFrame(results)
-        if "images" in df.columns:
-            df["images"] = df["images"].apply(lambda x: ";".join(x) if isinstance(x, list) else "")
+        new_df = pd.DataFrame(results)
+        if "images" in new_df.columns and len(new_df) > 0:
+            new_df["images"] = new_df["images"].apply(lambda x: ";".join(x) if isinstance(x, list) else "")
 
-        columns = [
-            "url",
-            "title",
-            "price",
-            "original_price",
-            "discount",
-            "description",
-            "images",
-            "specifications",
-            "features",
-            "brand",
-            "category",
-            "sku",
-            "availability",
-            "status",
-        ]
-        if "error" in df.columns:
-            columns.append("error")
+        if len(new_df) > 0:
+            columns = [
+                "url",
+                "title",
+                "price",
+                "original_price",
+                "discount",
+                "description",
+                "images",
+                "specifications",
+                "features",
+                "brand",
+                "category",
+                "sku",
+                "availability",
+                "status",
+            ]
+            if "error" in new_df.columns:
+                columns.append("error")
+            existing_cols = [c for c in columns if c in new_df.columns]
+            new_df = new_df[existing_cols]
 
-        existing_cols = [c for c in columns if c in df.columns]
-        df = df[existing_cols]
-        df.to_excel(output_file, index=False)
+        if existing_df is not None and len(new_df) > 0:
+            final_df = pd.concat([existing_df, new_df], ignore_index=True)
+        elif existing_df is not None:
+            final_df = existing_df
+        else:
+            final_df = new_df
+        final_df.to_excel(output_file, index=False)
 
         print("\n" + "=" * 60)
         print("SCRAPING SUMMARY")
         print("=" * 60)
         print(f"Total SKUs: {len(skus)}")
-        print(f"Rows written: {len(df)}")
+        print(f"Rows written: {len(final_df)}")
         print(f"Successful: {len([r for r in results if r.get('status') == 'SUCCESS'])}")
         print(f"Partial: {len([r for r in results if r.get('status') == 'PARTIAL'])}")
         print(f"Failed: {len([r for r in results if r.get('status') == 'FAILED'])}")
@@ -884,58 +914,84 @@ def extract_product_details(driver, product_url: str, category: str = "Electroni
 
 def scrape_all_products(base_url: str, output_file: str, headful: bool = False, delay: float = 2.0) -> None:
     """Scrape all products from the New Vision category page."""
-    
+
+    # Resume logic: load existing output and skip already-done URLs
+    existing_df = None
+    already_done_urls: set = set()
+    if os.path.exists(output_file):
+        try:
+            existing_df = pd.read_excel(output_file)
+            if "url" in existing_df.columns and "status" in existing_df.columns:
+                already_done_urls = set(
+                    existing_df.loc[existing_df["status"] == "SUCCESS", "url"].astype(str).str.strip()
+                )
+            print(f"Resuming: {len(already_done_urls)} URLs already done, will skip them")
+        except Exception as e:
+            print(f"Warning: could not read existing output ({e}), starting fresh")
+            existing_df = None
+
     driver = build_driver(headful)
-    
+
     try:
         print("Starting New Vision Universal Scraper")
         print(f"   Base URL: {base_url}")
         print(f"   Output: {output_file}")
         print(f"   Delay: {delay}s between requests")
         print()
-        
+
         # Extract category from URL
         category = extract_category_from_url(base_url)
         print(f"   Detected Category: {category}")
-        
+
         # Get all product links
         products = get_product_links(driver, base_url)
-        
+
         if not products:
-            print("❌ No products found!")
+            print("No products found!")
             return
-        
+
         print(f"\nFound {len(products)} products to scrape")
         print("=" * 60)
-        
+
         # Scrape each product
         all_results = []
         for i, product in enumerate(products, 1):
+            if product['url'] in already_done_urls:
+                print(f"\n[{i}/{len(products)}] Skipping already-done: {product['url'][:60]}")
+                continue
             print(f"\n[{i}/{len(products)}] {product['title'][:50]}...")
-            
+
             result = extract_product_details(driver, product['url'], category)
             all_results.append(result)
-            
+
             # Add delay between requests
             if i < len(products):
                 time.sleep(delay)
-        
+
         # Create DataFrame and save
-        df = pd.DataFrame(all_results)
-        
-        # Convert images list to semicolon-separated string
-        df['images'] = df['images'].apply(lambda x: ';'.join(x) if isinstance(x, list) else '')
-        
-        # Reorder columns
-        columns = ['url', 'title', 'price', 'original_price', 'discount', 'description', 'images', 
-                  'specifications', 'features', 'brand', 'category', 'sku', 'availability', 'status']
-        if 'error' in df.columns:
-            columns.append('error')
-        
-        df = df[columns]
-        
+        new_df = pd.DataFrame(all_results)
+
+        if len(new_df) > 0:
+            # Convert images list to semicolon-separated string
+            new_df['images'] = new_df['images'].apply(lambda x: ';'.join(x) if isinstance(x, list) else '')
+
+            # Reorder columns
+            columns = ['url', 'title', 'price', 'original_price', 'discount', 'description', 'images',
+                      'specifications', 'features', 'brand', 'category', 'sku', 'availability', 'status']
+            if 'error' in new_df.columns:
+                columns.append('error')
+            existing_cols = [c for c in columns if c in new_df.columns]
+            new_df = new_df[existing_cols]
+
+        if existing_df is not None and len(new_df) > 0:
+            final_df = pd.concat([existing_df, new_df], ignore_index=True)
+        elif existing_df is not None:
+            final_df = existing_df
+        else:
+            final_df = new_df
+
         # Save to Excel
-        df.to_excel(output_file, index=False)
+        final_df.to_excel(output_file, index=False)
         
         # Print summary
         print("\n" + "=" * 60)
