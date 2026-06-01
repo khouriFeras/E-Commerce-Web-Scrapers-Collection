@@ -55,10 +55,10 @@ results/
 checkpoint_*
 *.checkpoint
 
-# Excel/CSV output files (optional - uncomment if you don't want to track output files)
-# *.xlsx
-# *.xls
-# *.csv
+# Excel/CSV output files
+*.xlsx
+*.xls
+*.csv
 
 # Selenium/Playwright
 chromedriver*

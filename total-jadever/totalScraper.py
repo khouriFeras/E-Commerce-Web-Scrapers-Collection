@@ -1096,15 +1096,32 @@ def main():
     if TEST_MODE:
         df = df.head(TEST_LIMIT).copy()
         print(f"TEST MODE: Processing only first {TEST_LIMIT} items")
+
+    output_path = Path(args.out)
+    existing_df = None
+    already_scraped = set()
+
+    if output_path.exists():
+        try:
+            existing_df = pd.read_excel(output_path)
+            if "BAR CODE" in existing_df.columns and "Status" in existing_df.columns:
+                done = existing_df.loc[existing_df["Status"] == "SUCCESS", "BAR CODE"].astype(str).str.strip()
+                already_scraped = set(done.tolist())
+                if already_scraped:
+                    print(f"Resuming: {len(already_scraped)} barcodes already scraped, skipping them.")
+        except Exception as e:
+            print(f"Warning: Could not read existing output file: {e}")
+            existing_df = None
+
     driver = make_driver(headful=args.headful)
     wait = WebDriverWait(driver, TIMEOUT)
 
     results = []
-    
+
     try:
         barcodes = df[barcode_col].astype(str).fillna("").tolist()
         total = len(barcodes)
-        
+
         for idx, barcode in enumerate(barcodes, 1):
             barcode = str(barcode).strip()
             if not barcode or barcode.lower() in ["nan", "none", ""]:
@@ -1119,29 +1136,47 @@ def main():
                     "Status": "EMPTY_BARCODE"
                 })
                 continue
-            
+
+            if barcode in already_scraped:
+                print(f"[{idx}/{total}] Already scraped, skipping: {barcode}")
+                continue
+
             print(f"[{idx}/{total}] Processing barcode: {barcode}")
             result = scrape_product(driver, wait, barcode)
             results.append(result)
-            
+
             status_msg = result["Status"]
             title_preview = result["Title"][:50] if result["Title"] else "N/A"
             img_count = len(result["Images"].split(", ")) if result["Images"] else 0
             print(f"    -> {status_msg} | Title: {title_preview} | Images: {img_count}")
-            
+
             time.sleep(BETWEEN_PRODUCTS_SLEEP)
-    
+
     finally:
         driver.quit()
-    
+
     results_df = pd.DataFrame(results)
-    try:
-        output_df = df.merge(results_df, left_on=barcode_col, right_on="BAR CODE", how="left", suffixes=("", "_scraped"))
-    except Exception:
-        output_df = pd.concat([df, results_df], axis=1)
-    if len(output_df) == 0:
-        output_df = results_df
-    output_path = Path(args.out)
+
+    if len(results_df) > 0:
+        new_barcodes = set(results_df["BAR CODE"].astype(str).str.strip().tolist())
+        new_input_df = df[df[barcode_col].astype(str).str.strip().isin(new_barcodes)]
+        try:
+            new_output_df = new_input_df.merge(results_df, left_on=barcode_col, right_on="BAR CODE", how="left", suffixes=("", "_scraped"))
+        except Exception:
+            new_output_df = pd.concat([new_input_df.reset_index(drop=True), results_df.reset_index(drop=True)], axis=1)
+        if len(new_output_df) == 0:
+            new_output_df = results_df
+    else:
+        new_output_df = pd.DataFrame()
+
+    if existing_df is not None and len(new_output_df) > 0:
+        output_df = pd.concat([existing_df, new_output_df], ignore_index=True)
+    elif existing_df is not None:
+        print("No new barcodes to scrape.")
+        output_df = existing_df
+    else:
+        output_df = new_output_df if len(new_output_df) > 0 else results_df
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_df.to_excel(output_path, index=False)
     print(f"\nDone! Results saved to: {args.out}")

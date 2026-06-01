@@ -143,7 +143,8 @@ def download():
         p.relative_to(UPLOADS_DIR)
     except ValueError:
         return "Forbidden", 403
-    return send_file(str(p), as_attachment=True, download_name=p.name)
+    download_name = f"{p.stem}_scraped{p.suffix}"
+    return send_file(str(p), as_attachment=True, download_name=download_name)
 
 
 @app.route("/status/<job_id>")
