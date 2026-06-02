@@ -31,11 +31,24 @@ def norm_ws(s: str) -> str:
     return re.sub(r"\s+", " ", s or "").strip()
 
 def shopify_full_size(url: str) -> str:
-    """Strip Shopify CDN size suffix (e.g. _800x600) to get the master image."""
+    """Strip Shopify CDN size/crop suffix (e.g. _800x600, _1024x_crop_center) to get the master image."""
     if not url:
         return url
-    url = re.sub(r"_\d+x\d*(?=\.\w{2,4}(\?|$))", "", url)
+    url = re.sub(r"_\d+x\d*(_crop_\w+)?(?=\.\w{2,4}(\?|$))", "", url)
     return url
+
+
+def _normalise_img_url(url: str) -> Optional[str]:
+    """Return a normalised Shopify CDN master-image URL, or None if unusable."""
+    if not url or url.startswith("data:"):
+        return None
+    if url.startswith("//"):
+        url = "https:" + url
+    url = shopify_full_size(url)
+    url = re.sub(r"[&?]width=\d+", "", url)
+    url = re.sub(r"[&?]height=\d+", "", url)
+    url = url.rstrip("?&")
+    return url or None
 
 def parse_srcset(srcset: str) -> List[str]:
     if not srcset:
@@ -143,33 +156,53 @@ def verify_sku(driver, barcode: str, timeout: int) -> bool:
 
 
 def collect_images(driver) -> List[str]:
-    """Return full-size product image URLs from .product-gallery__thumbnail anchors."""
+    """Return full-size product image URLs using thumbnail anchors and main gallery imgs."""
     urls: List[str] = []
     seen: Set[str] = set()
 
-    # Each thumbnail is an <a class="product-gallery__thumbnail" href="//host/cdn/...file_1024x.jpg?v=...">
-    # The href already points to the image — just strip the Shopify size suffix for master quality.
+    def add(url: str) -> None:
+        u = _normalise_img_url(url)
+        if u and u not in seen:
+            seen.add(u)
+            urls.append(u)
+
+    # ── strategy 1: thumbnail anchors ────────────────────────────────────────
     thumbs = driver.find_elements(By.CSS_SELECTOR, ".scroller a.product-gallery__thumbnail")
     if not thumbs:
-        log.warning("  No .product-gallery__thumbnail anchors found inside .scroller")
-        return urls
+        thumbs = driver.find_elements(By.CSS_SELECTOR, "a.product-gallery__thumbnail")
+
+    if not thumbs:
+        log.warning("  No .product-gallery__thumbnail anchors found")
 
     for a in thumbs:
         try:
+            # href is often a direct CDN link on this Shopify theme
             href = (a.get_attribute("href") or "").strip()
-            if not href:
-                continue
-            if href.startswith("//"):
-                href = "https:" + href
-            # Strip Shopify size suffix (e.g. _1024x, _800x600) to get the master image
-            href = shopify_full_size(href)
-            # Strip width= query param added by the CDN
-            href = re.sub(r"[&?]width=\d+", "", href).rstrip("?&")
-            if href and href not in seen:
-                seen.add(href)
-                urls.append(href)
+            if href:
+                add(href)
+            # img inside anchor carries srcset / data-zoom with higher-res URLs
+            for img in a.find_elements(By.TAG_NAME, "img"):
+                u = pick_best_img_url(img)
+                if u:
+                    add(u)
         except StaleElementReferenceException:
             continue
+
+    # ── strategy 2: main gallery imgs (data-zoom-image / srcset) ─────────────
+    for sel in (
+        ".product-gallery__main img",
+        ".product-gallery__media img",
+        ".product-gallery__slide img",
+        ".product__media img",
+        ".product-single__photo img",
+    ):
+        for img in driver.find_elements(By.CSS_SELECTOR, sel):
+            try:
+                u = pick_best_img_url(img)
+                if u:
+                    add(u)
+            except StaleElementReferenceException:
+                continue
 
     log.debug(f"  product images found: {len(urls)}")
     return urls
