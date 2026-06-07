@@ -361,6 +361,16 @@ SCRAPERS = [
         "description": "Scrapes product data from RCC website",
     },
     {
+        "id": "xmart",
+        "name": "X Mart JO",
+        "script": "X mart/XMartScraper.py",
+        "in_flag": "--input",
+        "sku_flag": "--item-col",
+        "out_flag": "--output",
+        "headful_mode": "flag",
+        "description": "Scrapes title, description, images & product code from xmart.jo by item name",
+    },
+    {
         "id": "g_guard",
         "name": "G-Guard",
         "script": "G-Guard/gguard_scraper.py",
