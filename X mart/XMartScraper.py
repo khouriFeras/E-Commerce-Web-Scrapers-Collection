@@ -492,11 +492,23 @@ def main():
     items = df[item_col].fillna("").astype(str).tolist()
     items = [s.strip() for s in items if s.strip()]
 
+    # Build lookup to carry all input columns (e.g. Barcode) into output rows
+    scraped_col_names = {"Item", "Product URL", "Product Code", "Title", "Description",
+                         "Images", "Image Count", "Status", "Note"}
+    extra_input_cols = [c for c in df.columns if c != item_col and c not in scraped_col_names]
+    input_lookup: Dict[str, Dict] = {}
+    for _, row in df.iterrows():
+        key = str(row[item_col]).strip()
+        if key:
+            input_lookup[key] = {col: row[col] for col in extra_input_cols}
+
     if args.limit:
         items = items[: args.limit]
         print(f" TEST MODE: limited to {args.limit} items")
 
     print(f" Found {len(items)} items")
+    if extra_input_cols:
+        print(f" Carrying over input columns: {extra_input_cols}")
     print(f" Starting from row {args.start_row}")
 
     # Resume logic
@@ -534,6 +546,8 @@ def main():
 
             print(f"\n[{idx + 1 - start_idx}/{total}] Processing: {item}")
             result = scrape_item(driver, wait, item, args.pause)
+            for col, val in input_lookup.get(item, {}).items():
+                result[col] = val
             results.append(result)
 
             # Checkpoint every 10 items
