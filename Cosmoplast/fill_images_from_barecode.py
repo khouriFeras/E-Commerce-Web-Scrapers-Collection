@@ -15,7 +15,6 @@ from bs4 import BeautifulSoup
 
 BASE_URL = "https://shop.cosmoplast.com"
 SEARCH_URL = BASE_URL + "/search?type=product&q={q}&options%5Bprefix%5D=last"
-MAX_IMAGES = 5
 REQUEST_TIMEOUT = 30
 SLEEP_SECONDS = 0.35
 
@@ -158,7 +157,7 @@ def fetch_images_for_product_name(session: requests.Session, product_name: str) 
     images = extract_images_from_ld_json(product_resp.text)
     if not images:
         images = extract_images_fallback(product_resp.text)
-    return images[:MAX_IMAGES]
+    return images
 
 
 def main() -> None:
