@@ -505,13 +505,13 @@ def main():
     if os.path.exists(output_path):
         try:
             existing_df = pd.read_excel(output_path)
-            if "Item" in existing_df.columns and "Status" in existing_df.columns:
+            if "Item" in existing_df.columns:
                 already_done = set(
-                    existing_df.loc[existing_df["Status"] != "FAILED", "Item"]
+                    existing_df["Item"]
                     .astype(str)
                     .str.strip()
                 )
-            print(f" Resuming: {len(already_done)} items already done")
+            print(f" Resuming: {len(already_done)} items already in output")
         except Exception as e:
             print(f" Warning: could not read existing output ({e}), starting fresh")
             existing_df = None
@@ -539,7 +539,11 @@ def main():
             # Checkpoint every 10 items
             if (idx + 1) % 10 == 0:
                 cp_path = output_path.replace(".xlsx", f"_checkpoint_{idx + 1}.xlsx")
-                pd.DataFrame(results).to_excel(cp_path, index=False)
+                cp_new = pd.DataFrame(results)
+                if existing_df is not None and len(cp_new) > 0:
+                    pd.concat([existing_df, cp_new], join="outer", ignore_index=True).to_excel(cp_path, index=False)
+                else:
+                    cp_new.to_excel(cp_path, index=False)
                 print(f" Checkpoint saved: {cp_path}")
 
             time.sleep(args.pause)
@@ -547,7 +551,7 @@ def main():
         print(f"\n Saving results to: {output_path}")
         new_df = pd.DataFrame(results)
         if existing_df is not None and len(new_df) > 0:
-            final_df = pd.concat([existing_df, new_df], ignore_index=True)
+            final_df = pd.concat([existing_df, new_df], join="outer", ignore_index=True)
         elif existing_df is not None:
             final_df = existing_df
         else:
