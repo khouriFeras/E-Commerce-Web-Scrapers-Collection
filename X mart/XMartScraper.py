@@ -503,7 +503,6 @@ def main():
             input_lookup[key] = {col: row[col] for col in extra_input_cols}
 
     if args.limit:
-        items = items[: args.limit]
         print(f" TEST MODE: limited to {args.limit} items")
 
     print(f" Found {len(items)} items")
