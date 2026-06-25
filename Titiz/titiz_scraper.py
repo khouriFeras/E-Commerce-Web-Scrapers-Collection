@@ -394,7 +394,25 @@ def main() -> None:
         help="Max image count (0 means all).",
     )
     parser.add_argument("--limit", type=int, default=0, help="Only process first N rows (0=all).")
+    parser.add_argument("--code", default="", help="Search a single item code and print results.")
     args = parser.parse_args()
+
+    headless = parse_bool(args.headless)
+    driver = build_driver(headless=headless)
+    wait = WebDriverWait(driver, WAIT_SEC)
+
+    if args.code:
+        try:
+            result = scrape_one_item(driver, wait, args.code.strip(), max_images=args.max_images)
+        finally:
+            driver.quit()
+        images: List[str] = result["images"] if isinstance(result["images"], list) else []
+        print(f"status : {result['status']}")
+        print(f"note   : {result['note']}")
+        print(f"images : {len(images)}")
+        for url in images:
+            print(f"  {url}")
+        return
 
     script_dir = Path(__file__).resolve().parent
     input_path = Path(args.input)
@@ -418,10 +436,6 @@ def main() -> None:
     if "imgs" not in df.columns:
         df["imgs"] = ""
 
-    headless = parse_bool(args.headless)
-    driver = build_driver(headless=headless)
-    wait = WebDriverWait(driver, WAIT_SEC)
-
     try:
         total = len(df) if args.limit <= 0 else min(len(df), args.limit)
         print(f"Rows to process: {total}")
@@ -435,7 +449,7 @@ def main() -> None:
             print(f"[{idx + 1}/{total}] searching code={item_code}")
             result = scrape_one_item(driver, wait, str(item_code), max_images=args.max_images)
 
-            images: List[str] = result["images"] if isinstance(result["images"], list) else []
+            images = result["images"] if isinstance(result["images"], list) else []
             df.at[idx, "imgs"] = ";".join(images)
 
             print(

@@ -375,6 +375,10 @@ def _find_first_product_url(
         if c not in seen:
             seen.add(c)
             unique.append(c)
+
+    # Prefer English /en/product/ URLs whose slug references the model over
+    # Arabic-language duplicates that WooCommerce sometimes lists first.
+    unique.sort(key=lambda u: _score_product_link(u, model), reverse=True)
     return unique[0]
 
 
