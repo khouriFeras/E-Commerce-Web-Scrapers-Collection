@@ -440,6 +440,20 @@ SCRAPERS = [
         "headful_mode": "none",
         "description": "Scrapes product data from Ambro-Sol website (requests-based)",
     },
+    {
+        "id": "fairuzy",
+        "name": "Fairuzy JO",
+        "script": "fairuzy/fairuzy_scraper.py",
+        "in_flag": "--in",
+        "sku_flag": "--sku-col",
+        "out_flag": "--out",
+        "headful_mode": "flag",
+        "description": "Scrapes description & images from jo.fairuzy.com by product name",
+    },
+
+
+
+
 ]
 
 SCRAPERS_BY_ID = {s["id"]: s for s in SCRAPERS}
