@@ -60,7 +60,11 @@ def print_page_debug(page):
 
 def google_first_result(page, query):
     q = f"{query} arabi emart"
-    page.goto(f"https://www.google.com/search?hl=en&pws=0&q={quote_plus(q)}", wait_until="domcontentloaded")
+    try:
+        page.goto(f"https://www.google.com/search?hl=en&pws=0&q={quote_plus(q)}", wait_until="domcontentloaded")
+    except Exception as e:
+        print(f"  [Google Error] search failed: {e}", flush=True)
+        return (None, None, None)
     accept_google_consent(page)
     for a in page.locator("#search a:has(h3)").all()[:6]:
         href = (a.get_attribute("href") or "").strip()
@@ -86,14 +90,25 @@ def google_first_result(page, query):
 
 def ddg_first_result(page, query):
     q = f"{query} arabi emart"
-    page.goto(f"https://duckduckgo.com/?q={quote_plus(q)}&kl=us-en", wait_until="domcontentloaded")
-    candidates = page.locator("a[data-testid='result-title-a']")
-    if candidates.count() == 0:
-        candidates = page.locator("a.result__a")
-    for a in candidates.all()[:6]:
+    # Use the no-JS HTML endpoint: server-rendered, fast, and far more reliable
+    # than the JavaScript SPA at duckduckgo.com/?q=... (which times out in headless).
+    try:
+        page.goto(
+            f"https://html.duckduckgo.com/html/?q={quote_plus(q)}&kl=us-en",
+            wait_until="domcontentloaded",
+        )
+    except Exception as e:
+        print(f"  [DuckDuckGo Error] search failed: {e}", flush=True)
+        return (None, None, None)
+    for a in page.locator("a.result__a").all()[:6]:
         href = (a.get_attribute("href") or "").strip()
         if not href:
             continue
+        # html.duckduckgo.com wraps results in a redirect: //duckduckgo.com/l/?uddg=<encoded_url>
+        if "uddg=" in href:
+            href = parse_qs(urlparse(href).query).get("uddg", [href])[0]
+        elif href.startswith("//"):
+            href = "https:" + href
         try:
             tab = page.context.new_page()
             speed_up(tab)

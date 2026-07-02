@@ -48,7 +48,7 @@ for _stream in (sys.stdout, sys.stderr):
 BASE = "https://rrc.jo/"
 SEARCH_TMPL = "https://rrc.jo/?s={q}&post_type=product"
 
-DEFAULT_INPUT = os.path.join(os.path.dirname(__file__), "RCC.xlsx")
+DEFAULT_INPUT = os.path.join(os.path.dirname(__file__), "RRC-not-in-store.xlsx")
 DEFAULT_OUTPUT = os.path.join(os.path.dirname(__file__), "RCC_scraped.xlsx")
 
 ADDED_COLUMNS = [
@@ -266,29 +266,6 @@ def _dedupe_images(urls: Iterable[str]) -> List[str]:
 # ---------------------------------------------------------------------------
 
 
-def _norm_for_match(s: str) -> str:
-    s = s or ""
-    s = (
-        s.replace("\u200f", " ")
-        .replace("\u200e", " ")
-        .replace("\xa0", " ")
-        .replace("‑", "-")
-        .replace("–", "-")
-        .replace("—", "-")
-        .replace("−", "-")
-    )
-    return re.sub(r"\s+", " ", s).strip().lower()
-
-
-def _sku_norm(s: str) -> str:
-    """Aggressive SKU normalization for robust in-page existence checks."""
-    n = _norm_for_match(s)
-    return re.sub(r"[^a-z0-9]+", "", n)
-
-
-def _extract_body_text(soup: BeautifulSoup) -> str:
-    body = soup.find("body") or soup
-    return body.get_text(" ", strip=True)
 
 
 _MODEL_TOKEN_RE = re.compile(r"[A-Za-z0-9]{3,}")
@@ -515,7 +492,7 @@ class ProductResult:
     title: str = ""
     description: str = ""
     images: List[str] = field(default_factory=list)
-    validate: str = "No"
+    validate: str = ""
     status: str = "NOT_FOUND"
 
 
@@ -678,13 +655,6 @@ def search_and_scrape(
     res.description = _extract_description(product_soup)
     res.images = _extract_images(product_soup)
 
-    body_text = _extract_body_text(product_soup)
-    body_norm = _norm_for_match(body_text)
-    model_norm = _norm_for_match(model)
-    body_sku_norm = _sku_norm(body_text)
-    model_sku_norm = _sku_norm(model)
-    res.validate = "Yes" if (model_norm in body_norm or (model_sku_norm and model_sku_norm in body_sku_norm)) else "No"
-
     missing = []
     if not res.title:
         missing.append("title")
@@ -812,8 +782,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--headful", action="store_true", help="Run the Selenium fallback with a visible window")
     ap.add_argument(
         "--query-col",
-        default="model",
-        help='Column in the input sheet to use as the search query (default: "model")',
+        default="SKU",
+        help='Column in the input sheet to use as the search query (default: "SKU")',
     )
     args = ap.parse_args(argv)
 
@@ -833,7 +803,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     session = make_session(proxy=args.proxy)
     warmup(session)
     pacer = Pacer(base=args.sleep, jitter=args.jitter, long_every=args.long_every)
-    fallback = None if args.no_fallback else SeleniumFallback(headful=args.headful)
+    fallback = None if args.no_fallback else SeleniumFallback(headful=True)
 
     out_sheets: Dict[str, pd.DataFrame] = {}
     total_rows = 0
