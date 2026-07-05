@@ -241,7 +241,7 @@ def _guess_output(scraper: dict, input_path: str) -> Path | None:
 
 if __name__ == "__main__":
     import webbrowser
-    port = 5000
+    port = 5008
     print(f"\n  JafarShop Scraper Launcher")
     print(f"  Open: http://localhost:{port}\n")
     threading.Timer(1.2, lambda: webbrowser.open(f"http://localhost:{port}")).start()
