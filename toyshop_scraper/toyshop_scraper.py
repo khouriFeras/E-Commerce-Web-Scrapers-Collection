@@ -21,6 +21,7 @@ Login:
 """
 
 import argparse
+import json
 import os
 import time
 from urllib.parse import urljoin, urlparse, urlunparse
@@ -49,8 +50,23 @@ AUTOSAVE_EVERY = 25  # Save progress to disk every N rows (safety net for long r
 # app runs it from.
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-TOYSHOP_EMAIL = os.environ.get("TOYSHOP_EMAIL", "zaher.ghaith@jafarshop.com")
-TOYSHOP_PASSWORD = os.environ.get("TOYSHOP_PASSWORD", "Ameerzaher@2010")
+TOYSHOP_EMAIL = os.environ.get("TOYSHOP_EMAIL", "")
+TOYSHOP_PASSWORD = os.environ.get("TOYSHOP_PASSWORD", "")
+
+# If no environment variables were set (e.g. running from a packaged .exe
+# with no terminal), fall back to a local credentials file next to this
+# script. This file is NOT committed to Git (see .gitignore) and never
+# contains any hardcoded secrets in the source code itself.
+if not TOYSHOP_EMAIL or not TOYSHOP_PASSWORD:
+    _creds_path = os.path.join(SCRIPT_DIR, "credentials.json")
+    if os.path.exists(_creds_path):
+        try:
+            with open(_creds_path, "r", encoding="utf-8") as _f:
+                _creds = json.load(_f)
+            TOYSHOP_EMAIL = TOYSHOP_EMAIL or _creds.get("TOYSHOP_EMAIL", "")
+            TOYSHOP_PASSWORD = TOYSHOP_PASSWORD or _creds.get("TOYSHOP_PASSWORD", "")
+        except Exception as _e:
+            print(f"Warning: could not read credentials.json: {_e}")
 
 STORAGE_STATE_FILE = os.path.join(SCRIPT_DIR, "auth_state.json")
 
