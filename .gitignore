@@ -89,4 +89,3 @@ htmlcov/
 dmypy.json
 
 auth_state.json
-credentials.json
