@@ -453,6 +453,17 @@ SCRAPERS = [
 
 
 
+    {
+        "id": "toyshop",
+        "name": "Toyshop (Arabian Al-Ekha)",
+        "script": "toyshop_scraper/toyshop_scraper.py",
+        "in_flag": "--in",
+        "sku_flag": "--sku-col",
+        "out_flag": "--out",
+        "headful_mode": "flag",
+        "description": "Scrapes title, description & images from toyshop.alekha.com by ITEM# (يحتاج تسجيل دخول)",
+    },
+
 
 ]
 

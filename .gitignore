@@ -87,3 +87,9 @@ htmlcov/
 .mypy_cache/
 .dmypy.json
 dmypy.json
+
+
+auth_state.json
+
+ 
+ 
