@@ -4,7 +4,9 @@ import os
 import re
 from urllib.parse import quote_plus, urljoin, urlparse
 from typing import List, Dict, Any, Optional
-
+import sys
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 import pandas as pd
 from selenium import webdriver
 from selenium.webdriver.common.by import By
