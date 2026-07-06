@@ -825,6 +825,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             for col in ADDED_COLUMNS:
                 if col not in work_df.columns:
                     work_df[col] = ""
+                # pandas 3.x infers new string dtype for "" columns, which
+                # rejects int assignment (image_count). Keep them object dtype.
+                work_df[col] = work_df[col].astype(object)
 
             n_rows = len(work_df)
             if args.limit and args.limit > 0:
