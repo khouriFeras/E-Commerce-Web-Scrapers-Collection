@@ -4,12 +4,25 @@
 """
 hmgScraper_no_click.py
 - Searches hmg.jo for each SKU
-- DOES NOT click into results
+- Locates the first matching product tile in the search results
+- Opens the actual PRODUCT PAGE (this is the key change) so that we can
+  reach the full-resolution images and full description, which are NOT
+  available on the search results page (search tiles only expose 100x100
+  thumbnails).
 - Extracts description from electro-description clearfix class
-- Extracts image(s) from nswiper-wrapper class and other selectors
+- Extracts the ORIGINAL / full-resolution image(s), never thumbnails
 - Appends results to the SAME Excel file in columns:
     - "HMG Description" (from electro-description clearfix)
-    - "HMG Images"      (pipe-separated URLs from nswiper-wrapper)
+    - "HMG Images"      (pipe-separated URLs, full resolution)
+
+Flow:
+    Search SKU
+      -> Locate first matching product tile
+      -> Extract product URL from the tile
+      -> driver.get(product_url)
+      -> Extract original image(s) from the product page
+      -> Extract description from the product page
+      -> Return results
 
 Examples:
   python hmgScraper.py --in "Data\\products.xlsx" --sheet "Sheet1" --sku-col "SKU"
@@ -74,9 +87,31 @@ def safe_get_attr(el, *attrs) -> Optional[str]:
             pass
     return None
 
+def is_thumbnail_url(url: str) -> bool:
+    """
+    Detect common WordPress/WooCommerce THUMBNAIL suffixes so we NEVER
+    save a thumbnail as if it were the original image.
+
+    Important: WordPress also generates large, perfectly valid image
+    sizes with a WxH suffix (e.g. -768x1152.jpg, -1024x1536.jpg,
+    -1366x2048.jpg). Those are NOT thumbnails and must be kept.
+    Only reject the suffix if BOTH dimensions are small (<= 300px),
+    which matches genuine thumbnail sizes like -100x100, -150x150,
+    -300x300, -300x450.
+    """
+    if not url:
+        return True
+    m = re.search(r"-(\d{2,4})x(\d{2,4})\.(jpg|jpeg|png|webp)(\?|$)", url, re.I)
+    if not m:
+        return False  # no size suffix at all (e.g. "-scaled.jpg") -> treat as original
+    w, h = int(m.group(1)), int(m.group(2))
+    return w <= 300 and h <= 300
+
 def choose_largest_from_srcset(srcset: str) -> Optional[str]:
     """
-    Choose the largest image from srcset, prioritizing high-resolution images.
+    Parse a srcset attribute and return the URL with the largest declared
+    width (the 'w' descriptor), which corresponds to the highest
+    resolution version offered on the page.
     """
     try:
         best, best_w = None, -1
@@ -84,24 +119,11 @@ def choose_largest_from_srcset(srcset: str) -> Optional[str]:
             m = re.match(r"(.*?)\s+(\d+)w", p)
             if m:
                 url, w = m.group(1).strip(), int(m.group(2))
-                # Prioritize larger images, but also consider very large ones
                 if w > best_w:
                     best, best_w = url, w
             else:
-                # If no width specified, use as fallback
                 if best is None:
                     best = p.split()[0]
-        
-        # If we found a very small image, try to get a larger one
-        if best_w < 300 and best:
-            # Look for any image with higher resolution
-            for p in [x.strip() for x in srcset.split(",") if x.strip()]:
-                m = re.match(r"(.*?)\s+(\d+)w", p)
-                if m:
-                    url, w = m.group(1).strip(), int(m.group(2))
-                    if w > best_w:
-                        best, best_w = url, w
-        
         return best
     except Exception:
         return None
@@ -113,79 +135,28 @@ def dedup_preserve_order(items: List[str]) -> List[str]:
             out.append(x); seen.add(x)
     return out
 
-def prioritize_high_res_images(imgs: List[str]) -> List[str]:
-    """
-    Prioritize high-resolution images and remove low-quality duplicates.
-    """
-    if not imgs:
-        return imgs
-    
-    # Group images by base URL (without size parameters)
-    base_groups = {}
-    for img in imgs:
-        # Remove common size parameters to group similar images
-        base_url = re.sub(r'[?&](w|h|width|height|size)=\d+', '', img)
-        base_url = re.sub(r'-\d+x\d+', '', base_url)  # Remove -300x300 type suffixes
-        if base_url not in base_groups:
-            base_groups[base_url] = []
-        base_groups[base_url].append(img)
-    
-    # For each group, choose the highest quality image
-    prioritized = []
-    for base_url, group in base_groups.items():
-        if len(group) == 1:
-            prioritized.append(group[0])
-        else:
-            # Choose the image with the highest resolution indicators
-            best_img = group[0]
-            best_score = 0
-            
-            for img in group:
-                score = 0
-                # Score based on URL patterns that indicate high resolution
-                if 'large' in img.lower(): score += 3
-                if 'full' in img.lower(): score += 3
-                if 'original' in img.lower(): score += 3
-                if 'zoom' in img.lower(): score += 2
-                if 'high' in img.lower(): score += 2
-                
-                # Score based on size parameters in URL
-                size_matches = re.findall(r'(\d+)x(\d+)', img)
-                if size_matches:
-                    for w, h in size_matches:
-                        score += int(w) * int(h) // 10000  # Normalize to reasonable score
-                
-                # Score based on width parameters
-                width_matches = re.findall(r'[?&](?:w|width)=(\d+)', img)
-                if width_matches:
-                    score += max(int(w) for w in width_matches) // 100
-                
-                if score > best_score:
-                    best_score = score
-                    best_img = img
-            
-            prioritized.append(best_img)
-    
-    return prioritized
 
-# ---------- search-only extraction ----------
+# ---------- step 1: search results page (find the product URL only) ----------
 
 def get_first_result_tile(driver, timeout: int = 10, sku: Optional[str] = None):
     """
     Returns the first product tile from the search results.
     Prefers a tile whose link/text contains the SKU.
+    NOTE: we only use this tile to find the product URL - we never pull
+    images or description from it, since search tiles only expose
+    low-resolution thumbnails.
     """
     product_list_selectors = [
         "ul.products li.product",
         "div.products .product",
         ".archive .products .product",
-        ".products .product",  # More general selector
-        ".product",  # Even more general
+        ".products .product",
+        ".product",
     ]
     tiles = []
-    
+
     print(f"   → Looking for product tiles with selectors: {product_list_selectors}")
-    
+
     for css in product_list_selectors:
         try:
             print(f"   → Trying selector: {css}")
@@ -200,14 +171,12 @@ def get_first_result_tile(driver, timeout: int = 10, sku: Optional[str] = None):
             continue
 
     print(f"   → Total tiles found: {len(tiles)}")
-    
+
     if not tiles:
-        # Let's also try to see what's actually on the page
         try:
             page_source = driver.page_source
             print(f"   → Page title: {driver.title}")
             print(f"   → Page source length: {len(page_source)}")
-            # Look for any product-related elements
             all_products = driver.find_elements(By.CSS_SELECTOR, "*[class*='product']")
             print(f"   → Elements with 'product' in class: {len(all_products)}")
         except Exception as e:
@@ -231,87 +200,154 @@ def get_first_result_tile(driver, timeout: int = 10, sku: Optional[str] = None):
 
     return tiles[0]
 
-def extract_images_from_tile(tile) -> List[str]:
+def extract_product_url_from_tile(tile) -> Optional[str]:
     """
-    Extract image URLs from nswiper-wrapper class and other selectors.
-    Prioritizes high-resolution images and removes duplicates.
+    Pull the product page URL out of a search-result tile.
+    We deliberately do NOT extract images/description here anymore -
+    the tile is only used as a pointer to the real product page.
     """
+    link_selectors = [
+        "a.woocommerce-LoopProduct-link",
+        "a.woocommerce-loop-product__link",
+        "a",
+    ]
+    for css in link_selectors:
+        try:
+            a = tile.find_element(By.CSS_SELECTOR, css)
+            href = safe_get_attr(a, "href")
+            if href:
+                return href
+        except NoSuchElementException:
+            continue
+    return None
+
+
+# ---------- step 2: product page (real extraction happens here) ----------
+
+def extract_images_from_product_page(driver) -> List[str]:
+    """
+    Extract ORIGINAL / full-resolution image URLs from a product page.
+
+    Priority order (per image element found):
+      1. data-zoom-image   (WooCommerce zoom - always full resolution)
+      2. data-large_image  (alternate full-resolution attribute)
+      3. largest entry inside srcset
+      4. src / data-src / data-lazy  (only kept if it does NOT look like a thumbnail)
+
+    Thumbnail-looking URLs (e.g. -100x100.jpg, -300x300.jpg) are always
+    rejected so we never fall back to a low-res image by accident.
+    """
+    # IMPORTANT: scoped ONLY to the product gallery container.
+    # We deliberately do NOT fall back to a page-wide "img" selector,
+    # because that was picking up unrelated images (site logo, banners,
+    # plugin widgets, etc.) that happen to sit elsewhere on the page.
+    gallery_selectors = [
+        ".woocommerce-product-gallery",
+        "div.images.woocommerce-product-gallery",
+        ".product .images",
+    ]
+
+    gallery = None
+    for css in gallery_selectors:
+        try:
+            gallery = driver.find_element(By.CSS_SELECTOR, css)
+            print(f"   → [product page] Found gallery container with selector: {css}")
+            break
+        except NoSuchElementException:
+            continue
+
+    if gallery is None:
+        print("   → [product page] WARNING: no gallery container found, skipping image extraction")
+        return []
+
     img_selectors = [
-        ".nswiper-wrapper img",  # Primary selector for swiper images
-        "a.woocommerce-LoopProduct-link img",
-        "a img",
         "img.wp-post-image",
         "img",
     ]
-    imgs = []
-    seen_urls = set()  # Track seen URLs to avoid duplicates
-    
-    print(f"   → Looking for images with selectors: {img_selectors}")
-    
+
+    imgs: List[str] = []
+    seen_urls = set()
+
+    print(f"   → [product page] Looking for images with selectors: {img_selectors}")
+
     for css in img_selectors:
-        found_imgs = tile.find_elements(By.CSS_SELECTOR, css)
-        print(f"   → Found {len(found_imgs)} images with selector: {css}")
-        
+        found_imgs = gallery.find_elements(By.CSS_SELECTOR, css)
+        print(f"   → [product page] Found {len(found_imgs)} images with selector: {css}")
+
         for el in found_imgs:
-            # Priority 1: data-large_image or data-zoom-image (highest quality)
-            big = safe_get_attr(el, "data-large_image", "data-zoom-image")
-            if big:
-                if big.startswith("//"): big = "https:" + big
-                if big not in seen_urls:
-                    imgs.append(big)
-                    seen_urls.add(big)
-                    print(f"   → Added high-res image: {big}")
+            # Priority 1: data-zoom-image
+            zoom = safe_get_attr(el, "data-zoom-image")
+            if zoom:
+                if zoom.startswith("//"): zoom = "https:" + zoom
+                if not is_thumbnail_url(zoom) and zoom not in seen_urls:
+                    imgs.append(zoom)
+                    seen_urls.add(zoom)
+                    print(f"   → Added data-zoom-image (full-res): {zoom}")
                 continue
 
-            # Priority 2: srcset with largest size
+            # Priority 2: data-large_image
+            large = safe_get_attr(el, "data-large_image")
+            if large:
+                if large.startswith("//"): large = "https:" + large
+                if not is_thumbnail_url(large) and large not in seen_urls:
+                    imgs.append(large)
+                    seen_urls.add(large)
+                    print(f"   → Added data-large_image (full-res): {large}")
+                continue
+
+            # Priority 3: largest entry inside srcset
             srcset = safe_get_attr(el, "srcset")
             if srcset:
                 best = choose_largest_from_srcset(srcset)
                 if best:
                     if best.startswith("//"): best = "https:" + best
-                    if best not in seen_urls:
+                    if not is_thumbnail_url(best) and best not in seen_urls:
                         imgs.append(best)
                         seen_urls.add(best)
-                        print(f"   → Added srcset image: {best}")
-                continue
+                        print(f"   → Added largest srcset image: {best}")
+                    continue
 
-            # Priority 3: regular src attributes
+            # Priority 4: plain src (only if NOT a thumbnail)
             src = safe_get_attr(el, "src", "data-src", "data-lazy")
             if src:
                 if src.startswith("//"): src = "https:" + src
-                if src not in seen_urls:
+                if not is_thumbnail_url(src) and src not in seen_urls:
                     imgs.append(src)
                     seen_urls.add(src)
                     print(f"   → Added src image: {src}")
+                elif is_thumbnail_url(src):
+                    print(f"   → Skipped thumbnail-looking src: {src}")
 
-    # Filter for valid image formats and remove any remaining duplicates
+    # Keep only valid image formats, dedup, and drop anything that still
+    # looks like a thumbnail (belt-and-suspenders safety check).
     imgs = [u for u in imgs if re.search(r"\.(jpg|jpeg|png|webp)(\?|$)", u, re.I)]
+    imgs = [u for u in imgs if not is_thumbnail_url(u)]
     imgs = dedup_preserve_order(imgs)
-    
-    # Prioritize high-resolution images and remove low-quality duplicates
-    imgs = prioritize_high_res_images(imgs)
-    
-    print(f"   → Final prioritized images: {len(imgs)}")
+
+    print(f"   → [product page] Final full-resolution images: {len(imgs)}")
     return imgs
 
-def extract_description_from_tile(tile) -> str:
+def extract_description_from_product_page(driver) -> str:
     """
-    Extract description from electro-description clearfix class and other selectors.
+    Extract description from electro-description clearfix class (same
+    selectors/logic as before, just now run against the product page
+    instead of the search tile).
     """
     desc_selectors = [
-        ".electro-description.clearfix",  # Primary selector for description
+        ".electro-description.clearfix",
         ".electro-description",
         ".product-description",
-        ".description",
         ".woocommerce-product-details__short-description",
+        ".woocommerce-Tabs-panel--description",
+        ".description",
         "p",
     ]
-    
-    print(f"   → Looking for descriptions with selectors: {desc_selectors}")
-    
+
+    print(f"   → [product page] Looking for descriptions with selectors: {desc_selectors}")
+
     for css in desc_selectors:
         try:
-            desc_el = tile.find_element(By.CSS_SELECTOR, css)
+            desc_el = driver.find_element(By.CSS_SELECTOR, css)
             desc_text = desc_el.text.strip()
             print(f"   → Found description with selector {css}: {desc_text[:100]}...")
             if desc_text:
@@ -319,28 +355,33 @@ def extract_description_from_tile(tile) -> str:
         except NoSuchElementException:
             print(f"   → No description found with selector: {css}")
             continue
-    
+
     print(f"   → No description found with any selector")
     return ""
+
+
+# ---------- orchestration: search -> locate -> open product page -> extract ----------
 
 def scrape_for_sku(driver, sku: str, pause: float, timeout: int) -> Tuple[str, str]:
     """
     Returns (plain_description, images_joined)
-    - DOES NOT navigate into product pages.
-    - Extracts description from electro-description clearfix class
-    - Extracts image(s) from nswiper-wrapper class and other selectors
+
+    New flow:
+      1. Search for the SKU.
+      2. Locate the first matching product tile.
+      3. Pull the product URL from that tile.
+      4. Open the product page (driver.get).
+      5. Extract full-resolution images + description from the product page.
     """
     search_url = search_url_for_sku(sku)
-    print(f"   → Navigating to: {search_url}")
-    
+    print(f"   → Navigating to search page: {search_url}")
+
     driver.get(search_url)
     time.sleep(pause)
-    
-    # Check if we're actually on the search page
+
     current_url = driver.current_url
     print(f"   → Current URL: {current_url}")
-    
-    # Wait a bit more for the page to fully load
+
     time.sleep(2)
 
     tile = get_first_result_tile(driver, timeout=timeout, sku=sku)
@@ -348,21 +389,40 @@ def scrape_for_sku(driver, sku: str, pause: float, timeout: int) -> Tuple[str, s
         print(f"   → No product tile found for SKU: {sku}")
         return "", ""
 
-    print(f"   → Found product tile, extracting data...")
-    desc = extract_description_from_tile(tile)
-    imgs = extract_images_from_tile(tile)
-    
+    product_url = extract_product_url_from_tile(tile)
+    if not product_url:
+        print(f"   → Could not extract product URL from tile for SKU: {sku}")
+        return "", ""
+
+    print(f"   → Found product URL: {product_url}")
+    print(f"   → Opening product page...")
+
+    driver.get(product_url)
+    time.sleep(pause)
+
+    # Wait for the product gallery / main image to be present before reading it
+    try:
+        WebDriverWait(driver, timeout).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "img.wp-post-image, .woocommerce-product-gallery img"))
+        )
+    except TimeoutException:
+        print(f"   → Timed out waiting for product page images to load for SKU: {sku}")
+
+    desc = extract_description_from_product_page(driver)
+    imgs = extract_images_from_product_page(driver)
+
     print(f"   → Description length: {len(desc)}")
     print(f"   → Images found: {len(imgs)}")
-    
+
     return desc, " | ".join(imgs)
+
 
 # ---------- main ----------
 
 def main():
 
     ap = argparse.ArgumentParser(
-        description="Search-only image scraper for hmg.jo: extracts product images from the first search result tile (no clicks).",
+        description="Search + open product page scraper for hmg.jo: extracts full-resolution product images and descriptions from the actual product page.",
         formatter_class=argparse.RawTextHelpFormatter
     )
     ap.add_argument("--in", dest="input", required=True, help="Original Excel file (.xlsx/.xls).")
@@ -393,13 +453,11 @@ def main():
 
     # 3) Apply sample limit if specified
     if args.sample:
-        # Filter to only rows with valid SKUs first
         valid_skus = df[df[args.sku_col].notna() & (df[args.sku_col].astype(str).str.strip() != '') & (df[args.sku_col].astype(str).str.lower() != 'nan')]
         if len(valid_skus) == 0:
             print("ERROR: No valid SKUs found in the file", file=sys.stderr)
             sys.exit(2)
-        
-        # Take only the first N valid SKUs
+
         sample_indices = valid_skus.head(args.sample).index
         df = df.loc[sample_indices].copy()
         print(f"✓ Processing sample of {len(df)} products (requested: {args.sample})")
@@ -436,13 +494,10 @@ def main():
 
     # 7) Determine output file and save
     if args.sample:
-        # For sample mode, create a new file in the same directory
         base, extn = os.path.splitext(args.input)
         output_file = f"{base}_sample_{args.sample}{extn}"
     else:
-        # For normal mode, use the same file
         output_file = args.input
-        # Create backup only for normal mode
         if not args.no_backup:
             base, extn = os.path.splitext(args.input)
             backup = f"{base}.bak.xlsx"
@@ -454,7 +509,7 @@ def main():
 
     with pd.ExcelWriter(output_file, engine="openpyxl", mode="w") as writer:
         df.to_excel(writer, index=False)
-    
+
     if args.sample:
         print(f"✓ Sample file created: {output_file}")
     else:
