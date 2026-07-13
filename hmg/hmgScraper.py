@@ -246,9 +246,9 @@ def extract_images_from_product_page(driver) -> List[str]:
     """
     Extract ORIGINAL / full-resolution image URLs from a product page.
 
-    STRICTLY scoped to the CURRENT product's WooCommerce Product Gallery.
-    Never reaches into Related Products / Upsells / Cross-sells / product
-    sliders / widgets, even if the page layout changes in the future.
+    STRICTLY scoped to the CURRENT product's own gallery containers. Never
+    reaches into Related Products / Upsells / Cross-sells / product sliders
+    / widgets, even if the page layout changes in the future.
 
     Why the previous version could leak images from Related Products:
       - The old gallery selector list included ".product .images". ".product"
@@ -265,13 +265,22 @@ def extract_images_from_product_page(driver) -> List[str]:
         where BOTH dimensions were <=300px. Some WooCommerce thumbnail
         sizes are non-square (e.g. "-300x450"), which slipped through.
 
+    Why ".woocommerce-product-gallery" alone was still incomplete:
+      - This theme (Electro + a bolted-on "nickx" swiper) renders the same
+        product photos in more than one gallery. ".woocommerce-product-gallery"
+        sometimes only carries the FIRST image; any additional images (the
+        ones visible in the thumbnail nav strip, class "thumbnail-slider
+        ... nickx-slider-nav") only exist inside the paired main slider,
+        ".nickx-slider-for". That container is specific to the single
+        product's own image slider - it is never reused by Related Products
+        (which renders via a separate "wt-related-products"/owl-carousel
+        plugin with no "nickx"/"nswiper" classes at all) - so scanning it
+        carries the same no-leak guarantee as ".woocommerce-product-gallery".
+
     Fix:
-      - Only use ".woocommerce-product-gallery", which WooCommerce's
-        single-product template emits exactly once per page and which is
-        never reused by the Related Products / Upsell / Cross-sell loop
-        templates.
+      - Scan BOTH ".woocommerce-product-gallery" and ".nickx-slider-for".
       - Only search for images with selectors that specifically target
-        WooCommerce gallery images (no bare "img" fallback).
+        gallery images (no page-wide bare "img" fallback).
       - Add a class-based safety net to the thumbnail filter to catch
         non-square WooCommerce thumbnail sizes.
 
@@ -281,50 +290,56 @@ def extract_images_from_product_page(driver) -> List[str]:
       3. largest entry inside srcset
       4. src / data-src / data-lazy  (only kept if it does NOT look like a thumbnail)
     """
-    # Locate the CURRENT product's gallery only. ".woocommerce-product-gallery"
-    # is emitted once per single-product page by WooCommerce's own template
-    # and is not reused by Related Products / Upsell / Cross-sell loops, so
-    # there is no ambiguity about which container this is. We still take
-    # find_elements()[0] defensively (rather than find_element) so a
-    # multi-match situation degrades to "use the first one" instead of an
-    # exception, but this should normally return exactly one match.
-    gallery = None
+    # Locate the CURRENT product's gallery containers only. Both selectors
+    # below are emitted once per single-product page by this site's own
+    # templates and are never reused by Related Products / Upsell /
+    # Cross-sell loops, so there is no ambiguity about which containers
+    # these are.
+    gallery_selectors = [".woocommerce-product-gallery", ".nickx-slider-for"]
+    galleries = []
     try:
-        galleries = driver.find_elements(By.CSS_SELECTOR, ".woocommerce-product-gallery")
-        if galleries:
-            gallery = galleries[0]
-            print(f"   → [product page] Found gallery container: .woocommerce-product-gallery "
-                  f"({len(galleries)} match(es) on page, using the first)")
+        for css in gallery_selectors:
+            found = driver.find_elements(By.CSS_SELECTOR, css)
+            if found:
+                print(f"   → [product page] Found gallery container: {css} "
+                      f"({len(found)} match(es) on page)")
+                galleries.extend(found)
     except Exception as e:
         print(f"   → [product page] Error locating gallery container: {e}")
 
-    if gallery is None:
+    if not galleries:
         print("   → [product page] WARNING: no gallery container found, skipping image extraction")
         return []
-
-    # Only selectors that specifically target WooCommerce gallery images.
-    # No bare "img" fallback - that generic fallback is what let stray
-    # images (zoom-lens helpers, unrelated markup, etc.) leak in before.
-    img_selectors = [
-        "img.wp-post-image",
-        ".woocommerce-product-gallery__image img",
-        ".woocommerce-product-gallery__wrapper img",
-    ]
 
     imgs: List[str] = []
     seen_urls = set()
     seen_elements = set()
 
-    print(f"   → [product page] Looking for images with selectors: {img_selectors}")
-
-    for css in img_selectors:
-        found_imgs = gallery.find_elements(By.CSS_SELECTOR, css)
-        print(f"   → [product page] Found {len(found_imgs)} images with selector: {css}")
+    for gallery in galleries:
+        # The "nickx" swiper slider internally clones each real slide's
+        # <img> several times for its loop/lazy-load mechanism. Only the
+        # FIRST <img> inside each real ".nswiper-slide" carries the correct
+        # data-zoom-image; the rest are attribute-stripped clones that fall
+        # through to a medium-resolution "src" and get counted as bogus
+        # extra images. Where slides exist, take one <img> per slide;
+        # otherwise (e.g. ".woocommerce-product-gallery") query directly.
+        slides = gallery.find_elements(By.CSS_SELECTOR, ".nswiper-slide")
+        if slides:
+            found_imgs = []
+            for slide in slides:
+                slide_imgs = slide.find_elements(By.CSS_SELECTOR, "img")
+                if slide_imgs:
+                    found_imgs.append(slide_imgs[0])
+        else:
+            found_imgs = gallery.find_elements(By.CSS_SELECTOR, "img")
+        print(f"   → [product page] Found {len(found_imgs)} images in gallery container")
 
         for el in found_imgs:
-            # An <img> can match more than one of the selectors above
-            # (e.g. both "img.wp-post-image" and the wrapper selector) -
-            # only process each physical element once.
+            # The same physical image can appear in more than one gallery
+            # container (e.g. the main photo is duplicated into both the
+            # WooCommerce gallery and the nickx slider) - only process each
+            # physical element once. Duplicate URLs across containers are
+            # still caught below via seen_urls.
             el_id = el.id
             if el_id in seen_elements:
                 continue
