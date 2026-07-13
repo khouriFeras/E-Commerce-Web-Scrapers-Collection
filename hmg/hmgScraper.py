@@ -87,7 +87,7 @@ def safe_get_attr(el, *attrs) -> Optional[str]:
             pass
     return None
 
-def is_thumbnail_url(url: str) -> bool:
+def is_thumbnail_url(url: str, el=None) -> bool:
     """
     Detect common WordPress/WooCommerce THUMBNAIL suffixes so we NEVER
     save a thumbnail as if it were the original image.
@@ -98,14 +98,32 @@ def is_thumbnail_url(url: str) -> bool:
     Only reject the suffix if BOTH dimensions are small (<= 300px),
     which matches genuine thumbnail sizes like -100x100, -150x150,
     -300x300, -300x450.
+
+    Additional safety net: some themes generate non-square thumbnail
+    sizes (e.g. -300x450) where only ONE dimension is <=300px, which
+    would slip past the pure width/height check above. If we still
+    have a handle on the source <img> element, also reject it when its
+    class attribute openly identifies it as a WooCommerce thumbnail
+    attachment (e.g. "attachment-woocommerce_thumbnail",
+    "attachment-shop_thumbnail", "size-woocommerce_thumbnail").
     """
     if not url:
         return True
     m = re.search(r"-(\d{2,4})x(\d{2,4})\.(jpg|jpeg|png|webp)(\?|$)", url, re.I)
-    if not m:
-        return False  # no size suffix at all (e.g. "-scaled.jpg") -> treat as original
-    w, h = int(m.group(1)), int(m.group(2))
-    return w <= 300 and h <= 300
+    if m:
+        w, h = int(m.group(1)), int(m.group(2))
+        if w <= 300 and h <= 300:
+            return True
+    if el is not None:
+        cls = (safe_get_attr(el, "class") or "").lower()
+        if any(tag in cls for tag in (
+            "attachment-woocommerce_thumbnail",
+            "attachment-shop_thumbnail",
+            "size-woocommerce_thumbnail",
+            "size-shop_thumbnail",
+        )):
+            return True
+    return False
 
 def choose_largest_from_srcset(srcset: str) -> Optional[str]:
     """
@@ -228,45 +246,74 @@ def extract_images_from_product_page(driver) -> List[str]:
     """
     Extract ORIGINAL / full-resolution image URLs from a product page.
 
-    Priority order (per image element found):
+    STRICTLY scoped to the CURRENT product's WooCommerce Product Gallery.
+    Never reaches into Related Products / Upsells / Cross-sells / product
+    sliders / widgets, even if the page layout changes in the future.
+
+    Why the previous version could leak images from Related Products:
+      - The old gallery selector list included ".product .images". ".product"
+        matches every `li.product` tile inside the Related/Upsell/Cross-sell
+        loops too, not just the current product's wrapper. If any of those
+        loop tiles (or a theme wrapper around them) also carries an
+        "images" class, `find_element()` - which only returns the FIRST
+        DOM match - could resolve to a related-product container instead
+        of the real single-product gallery.
+      - Once the wrong container was captured, the generic "img" fallback
+        selector then happily pulled images from wherever that container
+        actually was.
+      - Additionally, the thumbnail filter only rejected size suffixes
+        where BOTH dimensions were <=300px. Some WooCommerce thumbnail
+        sizes are non-square (e.g. "-300x450"), which slipped through.
+
+    Fix:
+      - Only use ".woocommerce-product-gallery", which WooCommerce's
+        single-product template emits exactly once per page and which is
+        never reused by the Related Products / Upsell / Cross-sell loop
+        templates.
+      - Only search for images with selectors that specifically target
+        WooCommerce gallery images (no bare "img" fallback).
+      - Add a class-based safety net to the thumbnail filter to catch
+        non-square WooCommerce thumbnail sizes.
+
+    Priority order (per image element found), unchanged from before:
       1. data-zoom-image   (WooCommerce zoom - always full resolution)
       2. data-large_image  (alternate full-resolution attribute)
       3. largest entry inside srcset
       4. src / data-src / data-lazy  (only kept if it does NOT look like a thumbnail)
-
-    Thumbnail-looking URLs (e.g. -100x100.jpg, -300x300.jpg) are always
-    rejected so we never fall back to a low-res image by accident.
     """
-    # IMPORTANT: scoped ONLY to the product gallery container.
-    # We deliberately do NOT fall back to a page-wide "img" selector,
-    # because that was picking up unrelated images (site logo, banners,
-    # plugin widgets, etc.) that happen to sit elsewhere on the page.
-    gallery_selectors = [
-        ".woocommerce-product-gallery",
-        "div.images.woocommerce-product-gallery",
-        ".product .images",
-    ]
-
+    # Locate the CURRENT product's gallery only. ".woocommerce-product-gallery"
+    # is emitted once per single-product page by WooCommerce's own template
+    # and is not reused by Related Products / Upsell / Cross-sell loops, so
+    # there is no ambiguity about which container this is. We still take
+    # find_elements()[0] defensively (rather than find_element) so a
+    # multi-match situation degrades to "use the first one" instead of an
+    # exception, but this should normally return exactly one match.
     gallery = None
-    for css in gallery_selectors:
-        try:
-            gallery = driver.find_element(By.CSS_SELECTOR, css)
-            print(f"   → [product page] Found gallery container with selector: {css}")
-            break
-        except NoSuchElementException:
-            continue
+    try:
+        galleries = driver.find_elements(By.CSS_SELECTOR, ".woocommerce-product-gallery")
+        if galleries:
+            gallery = galleries[0]
+            print(f"   → [product page] Found gallery container: .woocommerce-product-gallery "
+                  f"({len(galleries)} match(es) on page, using the first)")
+    except Exception as e:
+        print(f"   → [product page] Error locating gallery container: {e}")
 
     if gallery is None:
         print("   → [product page] WARNING: no gallery container found, skipping image extraction")
         return []
 
+    # Only selectors that specifically target WooCommerce gallery images.
+    # No bare "img" fallback - that generic fallback is what let stray
+    # images (zoom-lens helpers, unrelated markup, etc.) leak in before.
     img_selectors = [
         "img.wp-post-image",
-        "img",
+        ".woocommerce-product-gallery__image img",
+        ".woocommerce-product-gallery__wrapper img",
     ]
 
     imgs: List[str] = []
     seen_urls = set()
+    seen_elements = set()
 
     print(f"   → [product page] Looking for images with selectors: {img_selectors}")
 
@@ -275,11 +322,19 @@ def extract_images_from_product_page(driver) -> List[str]:
         print(f"   → [product page] Found {len(found_imgs)} images with selector: {css}")
 
         for el in found_imgs:
+            # An <img> can match more than one of the selectors above
+            # (e.g. both "img.wp-post-image" and the wrapper selector) -
+            # only process each physical element once.
+            el_id = el.id
+            if el_id in seen_elements:
+                continue
+            seen_elements.add(el_id)
+
             # Priority 1: data-zoom-image
             zoom = safe_get_attr(el, "data-zoom-image")
             if zoom:
                 if zoom.startswith("//"): zoom = "https:" + zoom
-                if not is_thumbnail_url(zoom) and zoom not in seen_urls:
+                if not is_thumbnail_url(zoom, el) and zoom not in seen_urls:
                     imgs.append(zoom)
                     seen_urls.add(zoom)
                     print(f"   → Added data-zoom-image (full-res): {zoom}")
@@ -289,7 +344,7 @@ def extract_images_from_product_page(driver) -> List[str]:
             large = safe_get_attr(el, "data-large_image")
             if large:
                 if large.startswith("//"): large = "https:" + large
-                if not is_thumbnail_url(large) and large not in seen_urls:
+                if not is_thumbnail_url(large, el) and large not in seen_urls:
                     imgs.append(large)
                     seen_urls.add(large)
                     print(f"   → Added data-large_image (full-res): {large}")
@@ -301,7 +356,7 @@ def extract_images_from_product_page(driver) -> List[str]:
                 best = choose_largest_from_srcset(srcset)
                 if best:
                     if best.startswith("//"): best = "https:" + best
-                    if not is_thumbnail_url(best) and best not in seen_urls:
+                    if not is_thumbnail_url(best, el) and best not in seen_urls:
                         imgs.append(best)
                         seen_urls.add(best)
                         print(f"   → Added largest srcset image: {best}")
@@ -311,11 +366,11 @@ def extract_images_from_product_page(driver) -> List[str]:
             src = safe_get_attr(el, "src", "data-src", "data-lazy")
             if src:
                 if src.startswith("//"): src = "https:" + src
-                if not is_thumbnail_url(src) and src not in seen_urls:
+                if not is_thumbnail_url(src, el) and src not in seen_urls:
                     imgs.append(src)
                     seen_urls.add(src)
                     print(f"   → Added src image: {src}")
-                elif is_thumbnail_url(src):
+                elif is_thumbnail_url(src, el):
                     print(f"   → Skipped thumbnail-looking src: {src}")
 
     # Keep only valid image formats, dedup, and drop anything that still
@@ -400,10 +455,14 @@ def scrape_for_sku(driver, sku: str, pause: float, timeout: int) -> Tuple[str, s
     driver.get(product_url)
     time.sleep(pause)
 
-    # Wait for the product gallery / main image to be present before reading it
+    # Wait specifically for the main product image inside the WooCommerce
+    # Product Gallery (not "any image on the page"), so we never start
+    # extracting before the real gallery has rendered.
     try:
         WebDriverWait(driver, timeout).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, "img.wp-post-image, .woocommerce-product-gallery img"))
+            EC.presence_of_element_located(
+                (By.CSS_SELECTOR, ".woocommerce-product-gallery img.wp-post-image")
+            )
         )
     except TimeoutException:
         print(f"   → Timed out waiting for product page images to load for SKU: {sku}")
