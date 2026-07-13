@@ -1,24 +1,32 @@
-# Google approach: read product names from Excel → search "<name> arabi emart" → take first result → save
-# Prints fetched links and HTML snippet in the terminal
+# Arabi E-mart direct search: read SKUs from Excel → open
+#   https://arabiemart.com/<locale>/products/search?keyword=<sku>
+# → take the FIRST product result → save its URL.
+# Prints fetched links and an HTML snippet in the terminal.
 import argparse
 import sys
 import os
-import re
 import time
-from urllib.parse import urlparse, parse_qs, quote_plus
+
+from urllib.parse import quote_plus
 
 import pandas as pd
 from playwright.sync_api import sync_playwright
 
-OUTPUT_XLSX = "product_first_links.xlsx"
 CHECKPOINT_EVERY = 25
 DEFAULT_TIMEOUT_MS = 15000
 
+BASE = "https://arabiemart.com"
+DEFAULT_LOCALE = "jo-en"
+
+# Product detail pages look like /jo-en/product/<slug>-<id>/<vendor>.
+# The singular "/product/" segment excludes "/products/search" and "/category/..".
+PRODUCT_LINK_SEL = "a[href*='/product/']"
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/122.0 Safari/537.36"
 )
+
 
 def speed_up(page):
     def handler(route):
@@ -26,21 +34,6 @@ def speed_up(page):
             return route.abort()
         return route.continue_()
     page.route("**/*", handler)
-
-
-def accept_google_consent(page):
-    for sel in [
-        "button:has-text('I agree')",
-        "button:has-text('Accept all')",
-        "button:has-text('Accept')",
-        "button:has-text(' موافق ')",
-        "button:has-text('أوافق')",
-    ]:
-        try:
-            page.locator(sel).first.click(timeout=1200)
-            break
-        except Exception:
-            pass
 
 
 def print_page_debug(page):
@@ -53,83 +46,63 @@ def print_page_debug(page):
         html = page.content()
     except Exception as e:
         html = f"<html read error: {e}>"
-    print(f"    [OG:url] {og or '—'}", flush=True)
-    # FIX: properly terminated f-string on a single line
+    print(f"    [OG:url] {og or '-'}", flush=True)
     print(f"    [HTML snippet] {(html or '')[:500].replace('\n', ' ')}...", flush=True)
 
 
-def google_first_result(page, query):
-    q = f"{query} arabi emart"
-    try:
-        page.goto(f"https://www.google.com/search?hl=en&pws=0&q={quote_plus(q)}", wait_until="domcontentloaded")
-    except Exception as e:
-        print(f"  [Google Error] search failed: {e}", flush=True)
-        return (None, None, None)
-    accept_google_consent(page)
-    for a in page.locator("#search a:has(h3)").all()[:6]:
-        href = (a.get_attribute("href") or "").strip()
-        if not href or any(b in href for b in ["google.", "webcache", "translate.google"]):
-            continue
-        if href.startswith("/url?"):
-            href = parse_qs(urlparse(href).query).get("q", [href])[0]
-        try:
-            tab = page.context.new_page()
-            speed_up(tab)
-            tab.set_default_timeout(DEFAULT_TIMEOUT_MS)
-            tab.goto(href, wait_until="domcontentloaded")
-            final_url = tab.url
-            print(f"  [Google] {final_url}", flush=True)
-            print_page_debug(tab)
-            tab.close()
-        except Exception as e:
-            print(f"  [Google Error] {e}")
-            final_url = href
-        return (a.inner_text() or "", href, final_url)
-    return (None, None, None)
+def search_first_product(page, sku, locale=DEFAULT_LOCALE):
+    """Search arabiemart.com for `sku` and return the first product result.
 
-
-def ddg_first_result(page, query):
-    q = f"{query} arabi emart"
-    # Use the no-JS HTML endpoint: server-rendered, fast, and far more reliable
-    # than the JavaScript SPA at duckduckgo.com/?q=... (which times out in headless).
+    Returns (title, result_url, final_url); all None when there is no result.
+    """
+    url = f"{BASE}/{locale}/products/search?keyword={quote_plus(sku)}"
+    print(f"  [Search] {url}", flush=True)
     try:
-        page.goto(
-            f"https://html.duckduckgo.com/html/?q={quote_plus(q)}&kl=us-en",
-            wait_until="domcontentloaded",
-        )
+        page.goto(url, wait_until="domcontentloaded")
     except Exception as e:
-        print(f"  [DuckDuckGo Error] search failed: {e}", flush=True)
+        print(f"  [Search Error] {e}", flush=True)
         return (None, None, None)
-    for a in page.locator("a.result__a").all()[:6]:
-        href = (a.get_attribute("href") or "").strip()
-        if not href:
-            continue
-        # html.duckduckgo.com wraps results in a redirect: //duckduckgo.com/l/?uddg=<encoded_url>
-        if "uddg=" in href:
-            href = parse_qs(urlparse(href).query).get("uddg", [href])[0]
-        elif href.startswith("//"):
-            href = "https:" + href
-        try:
-            tab = page.context.new_page()
-            speed_up(tab)
-            tab.set_default_timeout(DEFAULT_TIMEOUT_MS)
-            tab.goto(href, wait_until="domcontentloaded")
-            final_url = tab.url
-            print(f"  [DuckDuckGo] {final_url}", flush=True)
-            print_page_debug(tab)
-            tab.close()
-        except Exception as e:
-            print(f"  [DuckDuckGo Error] {e}")
-            final_url = href
-        return (a.inner_text() or "", href, final_url)
-    return (None, None, None)
+
+    # Results render client-side; wait for the first product card to appear.
+    try:
+        page.wait_for_selector(PRODUCT_LINK_SEL, timeout=DEFAULT_TIMEOUT_MS)
+    except Exception:
+        print("  [No result]", flush=True)
+        return (None, None, None)
+
+    a = page.locator(PRODUCT_LINK_SEL).first
+    href = (a.get_attribute("href") or "").strip()
+    if not href:
+        print("  [No result]", flush=True)
+        return (None, None, None)
+    if href.startswith("/"):
+        href = BASE + href
+    title = (a.inner_text() or "").strip()
+
+    # Open the product page to resolve the final URL and dump a debug snippet.
+    final_url = href
+    try:
+        tab = page.context.new_page()
+        speed_up(tab)
+        tab.set_default_timeout(DEFAULT_TIMEOUT_MS)
+        tab.goto(href, wait_until="domcontentloaded")
+        final_url = tab.url
+        print(f"  [ArabiEmart] {final_url}", flush=True)
+        print_page_debug(tab)
+        tab.close()
+    except Exception as e:
+        print(f"  [ArabiEmart Error] {e}", flush=True)
+
+    return (title, href, final_url)
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Suppliers / Arabi E-mart link scraper")
+    ap = argparse.ArgumentParser(description="Arabi E-mart first-product link scraper (direct site search)")
     ap.add_argument("--in", dest="inp", required=True, help="Input Excel file")
     ap.add_argument("--out", required=True, help="Output Excel file")
-    ap.add_argument("--sku-col", dest="sku_col", default="Sellers", help="Column with product names (default: Sellers)")
+    ap.add_argument("--sku-col", dest="sku_col", default="SKU", help="Column with SKUs (default: SKU)")
+    ap.add_argument("--locale", default=DEFAULT_LOCALE, help=f"Site locale segment (default: {DEFAULT_LOCALE})")
+    ap.add_argument("--headful", action="store_true", help="Run a visible browser")
     args = ap.parse_args()
 
     if not os.path.exists(args.inp):
@@ -137,50 +110,44 @@ def main():
     df = pd.read_excel(args.inp)
     if args.sku_col not in df.columns:
         raise ValueError(f"Column '{args.sku_col}' not found. Available: {list(df.columns)}")
-    names = [str(x).strip() for x in df[args.sku_col].fillna("")]
+    skus = [str(x).strip() for x in df[args.sku_col].fillna("")]
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = p.chromium.launch(headless=not args.headful)
         context = browser.new_context(user_agent=USER_AGENT)
         page = context.new_page()
         speed_up(page)
         page.set_default_timeout(DEFAULT_TIMEOUT_MS)
 
         rows = []
-        for i, name in enumerate(names, 1):
-            if not name:
+        for i, sku in enumerate(skus, 1):
+            if not sku or sku.lower() in ("nan", "none"):
                 rows.append({
-                    "product_name": name,
-                    "engine": "",
+                    "sku": sku,
                     "result_title": "",
                     "result_url": "",
                     "final_url": "",
-                    "error": "empty_name",
+                    "error": "empty_sku",
                 })
                 continue
-            print(f"[{i}/{len(names)}] {name}", flush=True)
+            print(f"[{i}/{len(skus)}] {sku}", flush=True)
 
-            title, result_url, final_url = google_first_result(page, name)
-            engine = "google" if final_url else ""
-            if not final_url:
-                title, result_url, final_url = ddg_first_result(page, name)
-                engine = "duckduckgo" if final_url else ""
+            title, result_url, final_url = search_first_product(page, sku, args.locale)
 
             rows.append({
-                "product_name": name,
-                "engine": engine,
+                "sku": sku,
                 "result_title": title or "",
                 "result_url": result_url or "",
                 "final_url": final_url or "",
-                "error": "" if final_url else "no_result",
+                "error": "" if result_url else "no_result",
             })
 
             if i % CHECKPOINT_EVERY == 0:
                 pd.DataFrame(rows).to_excel(args.out, index=False)
-                print(f"[checkpoint] saved {len(rows)} rows → {args.out}", flush=True)
+                print(f"[checkpoint] saved {len(rows)} rows -> {args.out}", flush=True)
 
         pd.DataFrame(rows).to_excel(args.out, index=False)
-        print(f"Saved {len(rows)} rows → {args.out}", flush=True)
+        print(f"Saved {len(rows)} rows -> {args.out}", flush=True)
         browser.close()
 
 

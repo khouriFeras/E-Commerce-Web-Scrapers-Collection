@@ -437,23 +437,32 @@ def scrape_for_sku(driver, sku: str, pause: float, timeout: int) -> Tuple[str, s
     current_url = driver.current_url
     print(f"   → Current URL: {current_url}")
 
-    time.sleep(2)
+    # WordPress/WooCommerce auto-redirects straight to the product page
+    # when the search has exactly one match - we are ALREADY on the
+    # correct product page in that case. Looking for ".product" tiles
+    # here would instead match the "Related Products" carousel on THIS
+    # page and hijack us into scraping a completely different product.
+    if "/product/" in current_url:
+        print(f"   → Search redirected directly to product page (single match)")
+        product_url = current_url
+    else:
+        time.sleep(2)
 
-    tile = get_first_result_tile(driver, timeout=timeout, sku=sku)
-    if not tile:
-        print(f"   → No product tile found for SKU: {sku}")
-        return "", ""
+        tile = get_first_result_tile(driver, timeout=timeout, sku=sku)
+        if not tile:
+            print(f"   → No product tile found for SKU: {sku}")
+            return "", ""
 
-    product_url = extract_product_url_from_tile(tile)
-    if not product_url:
-        print(f"   → Could not extract product URL from tile for SKU: {sku}")
-        return "", ""
+        product_url = extract_product_url_from_tile(tile)
+        if not product_url:
+            print(f"   → Could not extract product URL from tile for SKU: {sku}")
+            return "", ""
 
-    print(f"   → Found product URL: {product_url}")
-    print(f"   → Opening product page...")
+        print(f"   → Found product URL: {product_url}")
+        print(f"   → Opening product page...")
 
-    driver.get(product_url)
-    time.sleep(pause)
+        driver.get(product_url)
+        time.sleep(pause)
 
     # Wait specifically for the main product image inside the WooCommerce
     # Product Gallery (not "any image on the page"), so we never start

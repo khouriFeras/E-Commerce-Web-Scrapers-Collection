@@ -1,17 +1,33 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+# Arabi E-mart scraper:
+#   for each SKU -> search https://arabiemart.com/<locale>/products/search?keyword=<sku>
+#   -> open the FIRST product -> verify the SKU appears on that product page
+#   -> scrape description (Body HTML) + product images.
+# If the SKU is not on the opened product page (fuzzy/suggested match), the row is skipped.
+
 import argparse, os, re, time
 from typing import List, Optional, Tuple
+from urllib.parse import quote_plus
 import pandas as pd
 
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
-from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, NoSuchElementException, StaleElementReferenceException
+from selenium.common.exceptions import TimeoutException, NoSuchElementException
+
+BASE = "https://arabiemart.com"
+DEFAULT_LOCALE = "jo-en"
+
+# Product detail pages: /jo-en/product/<slug>-<id>/<vendor>
+PRODUCT_LINK_SEL = "a[href*='/product/']"
+# Product description/detail block on the product page.
+DESC_SEL = "div.single-product-detail"
+# Related / other-merchant product cards — their images are NOT this product's.
+RELATED_CARD_CLASS = "product-card-third"
 
 # ---------------- utils ----------------
 
@@ -29,179 +45,55 @@ def build_driver(headful: bool, profile: Optional[str] = None) -> webdriver.Chro
     driver.set_page_load_timeout(45)
     return driver
 
-def wait_css(driver, sel, timeout=15):
-    return WebDriverWait(driver, timeout).until(EC.presence_of_element_located((By.CSS_SELECTOR, sel)))
-
 def normalize(s: str) -> str:
     return re.sub(r"[^0-9a-z]+", "", (s or "").lower())
 
-def parse_srcset(srcset: str) -> Optional[str]:
-    if not srcset:
-        return None
-    best_url, best_w = None, -1
-    for part in srcset.split(","):
-        bits = part.strip().split()
-        if not bits:
-            continue
-        url = bits[0]
-        w = 0
-        if len(bits) > 1 and bits[1].endswith("w"):
-            try: w = int(bits[1][:-1])
-            except: w = 0
-        if w > best_w:
-            best_w, best_url = w, url
-    return best_url or None
+# ---------------- image collection ----------------
 
-def absolutize(url: str) -> str:
-    if not url: return url
-    if url.startswith("//"): return "https:" + url
-    if url.startswith("/"):  return "https://arabiemart.com" + url
-    return url
+def _img_key(u: str) -> str:
+    """Dedup key: strip the CDN transform tail and any -WxH size suffix so that
+    different renditions of the same source photo collapse to one key."""
+    name = u.split("?")[0].split("/")[-1]
+    name = re.split(r"\.(?:jpe?g|png|webp|gif)_", name, maxsplit=1, flags=re.I)[0]
+    name = re.sub(r"-\d+x\d+$", "", name)
+    return name.lower()
 
-def clean_image_url(u: str) -> str:
-    if not u: return u
-    u = re.sub(r"([?&])(w|h|width|height|fit|format|auto)=[^&]+", r"\1", u)
-    u = re.sub(r"[?&]+$", "", u)
-    return u
-
-# ---------------- scraping pieces ----------------
-
-DESC_SEL = "p.whitespace-pre-wrap.mt-4.pt-4.border-t.break-words"
-GALLERY_SCOPE = "div.mt-4.flex.me-4"  # you asked to use this container
+def _img_size_score(u: str) -> int:
+    m = re.search(r"-(\d+)x(\d+)\.", u)
+    if m:
+        return int(m.group(1)) * int(m.group(2))
+    return 10 ** 9  # no size suffix -> treat as the original/largest rendition
 
 def collect_product_images(driver) -> List[str]:
-    print(f"   → Searching for product images...")
-    
-    # Target the specific UL structure you mentioned
-    ul_selectors = [
-        "ul.w-full.relative.flex.whitespace-nowrap.overflow-x-auto.lg\\:overflow-hidden",
-        "ul[class*='w-full'][class*='relative'][class*='flex']",
-        "ul[class*='whitespace-nowrap'][class*='overflow-x-auto']"
-    ]
-    
-    candidates = set()
-    
-    for ul_selector in ul_selectors:
-        try:
-            ul_elements = driver.find_elements(By.CSS_SELECTOR, ul_selector)
-            if ul_elements:
-                print(f"   → Found {len(ul_elements)} UL elements with selector: {ul_selector}")
-                
-                for ul in ul_elements:
-                    # Find all li elements inside this ul
-                    li_elements = ul.find_elements(By.CSS_SELECTOR, "li")
-                    print(f"   → Found {len(li_elements)} li elements in UL")
-                    
-                    for li in li_elements:
-                        # Find images inside each li
-                        img_elements = li.find_elements(By.CSS_SELECTOR, "img, picture source, picture img")
-                        for img in img_elements:
-                            try:
-                                srcset = img.get_attribute("srcset") or ""
-                                src = img.get_attribute("src") or ""
-                                alt = img.get_attribute("alt") or ""
-                                
-                                # Get the best URL
-                                url = parse_srcset(srcset) if srcset else src
-                                url = absolutize(url)
-                                
-                                if url and not url.startswith("data:"):
-                                    candidates.add((url, alt))
-                                    print(f"   → Product image: {url[:80]}...")
-                            except Exception:
-                                continue
-        except Exception as e:
-            print(f"   → Selector {ul_selector} failed: {e}")
+    """Collect this product's images (cdn.acabes.com), excluding related/merchant
+    product cards, and keep the largest rendition of each distinct photo."""
+    js = (
+        "return [...document.querySelectorAll('img')]"
+        f"  .filter(i => !i.closest('.{RELATED_CARD_CLASS}'))"
+        "  .map(i => i.currentSrc || i.getAttribute('src') || '')"
+        "  .filter(s => s.includes('cdn.acabes'));"
+    )
+    try:
+        raw = driver.execute_script(js) or []
+    except Exception as e:
+        print(f"   → image JS failed: {e}")
+        raw = []
+
+    best = {}   # key -> (url, score)
+    order = []  # preserve first-seen order
+    for u in raw:
+        low = u.lower()
+        if any(t in low for t in ["logo", "favicon", "placeholder", "sprite", "loading"]):
             continue
+        k = _img_key(u)
+        score = _img_size_score(u)
+        if k not in best:
+            order.append(k)
+            best[k] = (u, score)
+        elif score > best[k][1]:
+            best[k] = (u, score)
 
-    # Fallback: try the original gallery scope if no UL found
-    if not candidates:
-        print(f"   → No UL gallery found, trying fallback selectors...")
-        fallback_selectors = [
-            f"{GALLERY_SCOPE} img",
-            f"{GALLERY_SCOPE} picture source",
-            f"{GALLERY_SCOPE} picture img",
-            "main img"
-        ]
-        
-        for css in fallback_selectors:
-            try:
-                elements = driver.find_elements(By.CSS_SELECTOR, css)
-                if elements:
-                    print(f"   → Found {len(elements)} images with fallback selector: {css}")
-                    for el in elements:
-                        try:
-                            srcset = el.get_attribute("srcset") or ""
-                            src = el.get_attribute("src") or ""
-                            alt = el.get_attribute("alt") or ""
-                            
-                            url = parse_srcset(srcset) if srcset else src
-                            url = absolutize(url)
-                            
-                            if url and not url.startswith("data:"):
-                                candidates.add((url, alt))
-                                print(f"   → Fallback image: {url[:80]}...")
-                        except Exception:
-                            continue
-            except Exception:
-                continue
-
-    # Filter out non-product images and group by base URL
-    filtered = []
-    url_groups = {}  # base_url -> (full_url, alt, size_estimate)
-    
-    for url, alt in candidates:
-        low_url = url.lower()
-        low_alt = alt.lower()
-        
-        # Skip obvious non-product images
-        skip_terms = [
-            "logo", "icon", "favicon", "banner", "header", "footer", 
-            "nav", "menu", "button", "arrow", "social", "facebook", 
-            "instagram", "twitter", "youtube", "payment", "visa", 
-            "mastercard", "loading", "spinner", "error", "404"
-        ]
-        
-        if any(term in low_url or term in low_alt for term in skip_terms):
-            continue
-            
-        # Skip very small images
-        if any(size in low_url for size in ["16x16", "24x24", "32x32", "48x48"]):
-            continue
-            
-        cleaned_url = clean_image_url(url)
-        
-        # Extract base URL (remove size parameters)
-        base_url = re.sub(r'[?&](w|h|width|height|size|resize|fit|format|auto)=[^&]*', '', cleaned_url)
-        base_url = re.sub(r'[?&]+$', '', base_url)
-        
-        # Estimate image size from URL parameters
-        size_estimate = 0
-        size_match = re.search(r'[?&](w|width)=(\d+)', cleaned_url)
-        if size_match:
-            size_estimate = int(size_match.group(2))
-        else:
-            # If no size parameter, check for common size indicators in URL
-            if any(size in cleaned_url for size in ['_large', '_big', '_full', '_original']):
-                size_estimate = 1000
-            elif any(size in cleaned_url for size in ['_medium', '_med']):
-                size_estimate = 500
-            elif any(size in cleaned_url for size in ['_small', '_thumb', '_mini']):
-                size_estimate = 200
-            else:
-                size_estimate = 500  # default
-        
-        # Keep only the largest version of each base URL
-        if base_url not in url_groups or size_estimate > url_groups[base_url][2]:
-            url_groups[base_url] = (cleaned_url, alt, size_estimate)
-            print(f"   → Added image: {cleaned_url[:80]}... (size: {size_estimate})")
-
-    # Extract final URLs
-    ordered = []
-    for base_url, (final_url, alt, size) in url_groups.items():
-        ordered.append(final_url)
-        print(f"   → Final image: {final_url[:80]}... (size: {size})")
-
+    ordered = [best[k][0] for k in order]
     print(f"   → Found {len(ordered)} unique product images")
     return ordered
 
@@ -212,161 +104,96 @@ def get_description_html(driver) -> str:
     except NoSuchElementException:
         return ""
 
-# ---------------- step 1+2: search then click first product ----------------
+# ---------------- search -> open first product ----------------
 
-def search_and_open_first_product(driver, sku: str, pause: float) -> Optional[str]:
-    """Search using direct URL and click first product result."""
-    search_url = f"https://arabiemart.com/search?keyword={sku}"
+def search_and_open_first_product(driver, sku: str, pause: float, locale: str) -> Optional[str]:
+    search_url = f"{BASE}/{locale}/products/search?keyword={quote_plus(sku)}"
     print(f"   → Searching: {search_url}")
     driver.get(search_url)
 
-    # Wait for search results to load
-    print(f"   → Waiting for search results...")
     try:
         WebDriverWait(driver, 20).until(
-            EC.any_of(
-                EC.presence_of_all_elements_located((By.CSS_SELECTOR, 'a[href*="/items/"]')),
-                EC.presence_of_all_elements_located((By.CSS_SELECTOR, "article.card")),
-                EC.presence_of_all_elements_located((By.CSS_SELECTOR, "main a[href*='/product']"))
-            )
+            EC.presence_of_element_located((By.CSS_SELECTOR, PRODUCT_LINK_SEL))
         )
-        print(f"   → Search results loaded")
     except TimeoutException:
-        print(f"   → Timeout waiting for search results")
+        print(f"   × No product results")
         return None
 
-    # Find product links - try multiple selectors
-    links = []
-    selectors = [
-        'a[href*="/items/"]',  # From your working code
-        "article.card a[href*='/product']",
-        "main a[href*='/product']",
-        "a[href*='/product']"
-    ]
-    
-    for sel in selectors:
-        try:
-            found_links = driver.find_elements(By.CSS_SELECTOR, sel)
-            for link in found_links:
-                href = link.get_attribute("href") or ""
-                if href and ("/product" in href or "/items/" in href):
-                    # Skip non-product links
-                    if not any(x in href for x in ["/account", "/login", "/orders", "/cart", "/search"]):
-                        links.append(link)
-                        print(f"   → Found product link: {href}")
-            if links:
-                break
-        except Exception as e:
-            print(f"   → Selector {sel} failed: {e}")
-            continue
-    
-    if not links:
-        print(f"   × No product links found")
+    href = None
+    for link in driver.find_elements(By.CSS_SELECTOR, PRODUCT_LINK_SEL):
+        h = (link.get_attribute("href") or "").strip()
+        if h and "/product/" in h:
+            href = h
+            break
+    if not href:
+        print(f"   × No product link found")
         return None
 
-    # Use the first product link
-    link = links[0]
-    href = link.get_attribute("href")
-    print(f"   → Using first product: {href}")
-
-    # Check if link is visible and clickable
-    try:
-        is_displayed = link.is_displayed()
-        is_enabled = link.is_enabled()
-        print(f"   → Link visible: {is_displayed}, enabled: {is_enabled}")
-    except Exception as e:
-        print(f"   → Error checking link state: {e}")
-
-    # Try to click the link
-    old_url = driver.current_url
-    print(f"   → Current URL before click: {old_url}")
-    
-    try:
-        # Scroll to element first
-        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", link)
-        time.sleep(0.5)
-        
-        # Try clicking
-        print(f"   → Attempting to click...")
-        link.click()
-        print(f"   → Click executed")
-        
-        # Wait for navigation
-        try:
-            WebDriverWait(driver, 10).until(EC.url_changes(old_url))
-            print(f"   → Navigation successful, new URL: {driver.current_url}")
-        except TimeoutException:
-            print(f"   → No navigation detected, trying direct navigation")
-            driver.get(href)
-            
-    except Exception as e:
-        print(f"   → Click failed: {e}, trying JavaScript click")
-        try:
-            driver.execute_script("arguments[0].click();", link)
-            print(f"   → JavaScript click executed")
-            try:
-                WebDriverWait(driver, 10).until(EC.url_changes(old_url))
-                print(f"   → Navigation successful after JS click")
-            except TimeoutException:
-                print(f"   → No navigation after JS click, using direct navigation")
-                driver.get(href)
-        except Exception as e2:
-            print(f"   → JavaScript click also failed: {e2}, using direct navigation")
-            driver.get(href)
-    
+    print(f"   → First product: {href}")
+    driver.get(href)
     time.sleep(pause)
-    final_url = driver.current_url
-    print(f"   → Final URL: {final_url}")
-    return final_url
+    return driver.current_url
 
-# ---------------- step 3: check SKU on product page ----------------
+# ---------------- SKU verification on the product page ----------------
 
 def page_contains_sku(driver, target_sku: str) -> bool:
-    raw = (driver.find_element(By.TAG_NAME, "body").text or "").lower()
-    if target_sku.lower() in raw:
+    # Check only the product's own detail block + page title. The full page body
+    # includes "Similar Product" / "Merchant Other Product" sections whose model
+    # numbers cause false positives (e.g. searching TAC-12CHSD/TPH11 matches a
+    # listed TAC-12CHSD/TPH11I on an unrelated product's page).
+    parts = []
+    try:
+        parts.append(driver.find_element(By.CSS_SELECTOR, DESC_SEL).text or "")
+    except NoSuchElementException:
+        pass
+    parts.append(driver.title or "")
+    hay = " ".join(parts)
+    if target_sku.lower() in hay.lower():
         return True
-    return normalize(target_sku) in normalize(raw)
+    return normalize(target_sku) in normalize(hay)
 
-# ---------------- step 4: scrape ----------------
+# ---------------- scrape ----------------
 
 def scrape_product(driver) -> Tuple[str, str]:
     body_html = get_description_html(driver)
     images = collect_product_images(driver)
     return body_html, ";".join(images)
 
-# ---------------- per-SKU orchestrator (1..5) ----------------
+# ---------------- per-SKU orchestrator ----------------
 
-def run_for_sku(driver, sku: str, pause: float) -> Tuple[str, str, str]:
-    # 1+2) search and click first product
-    url = search_and_open_first_product(driver, sku, pause)
+def run_for_sku(driver, sku: str, pause: float, locale: str) -> Tuple[str, str, str]:
+    # 1) search + open the first product
+    url = search_and_open_first_product(driver, sku, pause, locale)
     if not url:
         return "", "", ""
 
-    # wait for product signals
+    # 2) wait for the product page to render
     try:
         WebDriverWait(driver, 15).until(
-            EC.any_of(
-                EC.presence_of_element_located((By.CSS_SELECTOR, "h1.bigtitle")),
-                EC.presence_of_element_located((By.CSS_SELECTOR, DESC_SEL))
-            )
+            EC.presence_of_element_located((By.CSS_SELECTOR, DESC_SEL))
         )
     except TimeoutException:
         pass
 
-    # 3) scrape (no SKU checking)
-    body_html, image_src = scrape_product(driver)
+    # 3) verify the SKU actually appears on the opened product page. The site returns
+    #    fuzzy suggestions, so the first product is often a different variant.
+    if not page_contains_sku(driver, sku):
+        print(f"   × SKU not on product page (fuzzy match) → skipping")
+        return "", "", ""
 
-    # 4) return (repeat happens in caller loop)
+    # 4) scrape description + images
+    body_html, image_src = scrape_product(driver)
     return body_html, image_src, url
 
 # ---------------- CLI ----------------
 
 def main():
-    ap = argparse.ArgumentParser(description="Arabiemart scraper: search -> click first -> scrape -> repeat.")
+    ap = argparse.ArgumentParser(description="Arabiemart scraper: search -> first product -> verify SKU -> scrape.")
     ap.add_argument("--in", dest="inp", required=True, help="Input Excel file")
     ap.add_argument("--out", dest="out", required=True, help="Output Excel file")
     ap.add_argument("--sheet", dest="sheet", default=None, help="Worksheet name (default: first)")
     ap.add_argument("--sku-col", dest="sku_col", required=True, help="Column containing SKUs")
+    ap.add_argument("--locale", default=DEFAULT_LOCALE, help=f"Site locale segment (default: {DEFAULT_LOCALE})")
     ap.add_argument("--pause", type=float, default=1.0, help="Pause between steps (sec)")
     ap.add_argument("--headful", action="store_true", help="Headed Chrome")
     ap.add_argument("--profile", default=None, help="Chrome user-data-dir (optional)")
@@ -388,7 +215,6 @@ def main():
         if col not in df.columns:
             df[col] = ""
 
-
     driver = build_driver(args.headful, args.profile)
 
     try:
@@ -397,9 +223,9 @@ def main():
             if not sku or sku.lower() in ("nan", "none"):
                 continue
 
-            print(f"[{i+1}/{len(df)}] SKU={sku} → search/click/scrape")
+            print(f"[{i+1}/{len(df)}] SKU={sku} -> search/open/verify/scrape")
             try:
-                body_html, image_src, url = run_for_sku(driver, sku, args.pause)
+                body_html, image_src, url = run_for_sku(driver, sku, args.pause, args.locale)
             except TimeoutException:
                 body_html, image_src, url = "", "", ""
 
@@ -407,9 +233,9 @@ def main():
                 df.at[i, "Body (HTML)"] = body_html
                 df.at[i, "Image Src"]   = image_src
                 df.at[i, "Source_URL"]  = url
-                print(f"   ✓ OK: {url} | images={len(image_src.split(';')) if image_src else 0}")
+                print(f"   OK: {url} | images={len(image_src.split(';')) if image_src else 0}")
             else:
-                print(f"   × Not found")
+                print(f"   x Not found")
 
     finally:
         driver.quit()
@@ -418,9 +244,9 @@ def main():
     output_path = str(args.out).lower()
     if not output_path.endswith('.xlsx'):
         output_path = output_path.replace('.xls', '.xlsx')
-    
+
     df.to_excel(output_path, index=False)
-    print(f"\nDone → {output_path}")
+    print(f"\nDone -> {output_path}")
 
 if __name__ == "__main__":
     main()

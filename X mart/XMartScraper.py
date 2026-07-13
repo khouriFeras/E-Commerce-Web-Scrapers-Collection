@@ -2,6 +2,16 @@ import time
 import argparse
 import os
 import re
+import sys
+
+# Windows consoles default to cp1252, which can't encode characters like
+# "→" (the arrow used in progress prints). Force UTF-8 so these prints
+# don't crash the scraper. The desktop_app launcher reads our stdout as UTF-8.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
 from urllib.parse import quote_plus, urljoin, urlparse
 from typing import List, Dict, Any, Optional
 
