@@ -465,6 +465,20 @@ SCRAPERS = [
     },
 
 
+
+
+
+    {
+        "id": "zananiri",
+        "name": "Zananiri JO",
+        "script": "zananiri/zananiri_scraper.py",
+        "in_flag": "--in",
+        "sku_flag": "--sku-col",
+        "out_flag": "--out",
+        "headful_mode": "none",
+        "description": "Scrapes product descriptions from zananirijo.com by SKU",
+    }
+
 ]
 
 SCRAPERS_BY_ID = {s["id"]: s for s in SCRAPERS}
