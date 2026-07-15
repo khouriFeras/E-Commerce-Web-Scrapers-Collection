@@ -803,6 +803,94 @@ def _load_skus_from_excel(path: str, sku_col: str) -> List[str]:
     return out
 
 
+def _safe_new_col(desired: str, existing_cols) -> str:
+    """
+    Return a column name to use for scraped output that won't clobber a column
+    already present in the user's original sheet. If `desired` already exists
+    in the original file, suffix it (e.g. 'SKU' -> 'SKU_scraped') instead of
+    overwriting the user's data.
+    """
+    existing = set(existing_cols)
+    if desired not in existing:
+        return desired
+    candidate = f"{desired}_scraped"
+    i = 2
+    while candidate in existing:
+        candidate = f"{desired}_scraped_{i}"
+        i += 1
+    return candidate
+
+
+class ScrapeColumns:
+    """Holds the (collision-safe) output column names, computed once from the
+    original input sheet's columns so the added columns never overwrite the
+    user's existing data."""
+
+    def __init__(self, original_cols):
+        self.title = _safe_new_col("Title", original_cols)
+        self.sku = _safe_new_col("Scraped_SKU", original_cols)
+        self.price = _safe_new_col("Price", original_cols)
+        self.description = _safe_new_col("Description", original_cols)
+        self.images = _safe_new_col("Images", original_cols)
+        self.product_url = _safe_new_col("ProductURL", original_cols)
+        self.search_url = _safe_new_col("SearchURL", original_cols)
+        self.found = _safe_new_col("Found", original_cols)
+        self.note = _safe_new_col("Note", original_cols)
+
+    def all_cols(self):
+        return [
+            self.title, self.sku, self.price, self.description,
+            self.images, self.product_url, self.search_url, self.found, self.note,
+        ]
+
+
+def _ensure_scrape_columns(df: pd.DataFrame, cols: "ScrapeColumns") -> pd.DataFrame:
+    """Add the scraped-data columns to df if they don't already exist, without
+    touching any pre-existing columns/values."""
+    for c in cols.all_cols():
+        if c not in df.columns:
+            df[c] = False if c == cols.found else ""
+    return df
+
+
+def _write_result_into_row(df: pd.DataFrame, idx, cols: "ScrapeColumns", result: Dict[str, Any]) -> None:
+    """Write one scrape result into df at row idx, using the collision-safe columns.
+    Leaves every other existing column in that row untouched."""
+    images = result.get("Images", [])
+    if isinstance(images, list):
+        images = ";".join(images)
+    df.at[idx, cols.title] = result.get("Title", "")
+    df.at[idx, cols.sku] = result.get("SKU", "")
+    df.at[idx, cols.price] = result.get("Price", "")
+    df.at[idx, cols.description] = result.get("Description", "")
+    df.at[idx, cols.images] = images or ""
+    df.at[idx, cols.product_url] = result.get("ProductURL", "")
+    df.at[idx, cols.search_url] = result.get("SearchURL", "")
+    df.at[idx, cols.found] = bool(result.get("Found", False))
+    df.at[idx, cols.note] = result.get("Note", "")
+
+
+def _load_resumable_df(output_file: str, df_in: pd.DataFrame, cols: "ScrapeColumns") -> pd.DataFrame:
+    """
+    If a previous run already saved --out, reuse that file as the working
+    dataframe (it already contains the original columns + scraped columns +
+    progress) so we resume instead of losing prior work. Otherwise start from
+    a copy of the original input sheet with the scraped columns appended.
+    """
+    if os.path.exists(output_file):
+        try:
+            prev = pd.read_excel(output_file)
+            if len(prev) == len(df_in) and cols.found in prev.columns:
+                print(f"Resuming from existing output: {output_file}")
+                return prev
+            else:
+                print("Warning: existing output doesn't match current input shape, starting fresh")
+        except Exception as e:
+            print(f"Warning: could not read existing output ({e}), starting fresh")
+    out_df = df_in.copy()
+    return _ensure_scrape_columns(out_df, cols)
+
+
 def main():
     """Main function for CLI usage."""
     # Windows consoles may use legacy encodings; force UTF-8 to avoid crashes on non-ASCII output.
@@ -829,8 +917,9 @@ def main():
     ap.add_argument("--pause", type=float, default=2.0, help="Pause between requests (seconds)")
     ap.add_argument("--headless", action="store_true", help="Run in headless mode")
     ap.add_argument("--max-img", type=int, default=10, help="Maximum images to collect per product")
+    ap.add_argument("--save-every", type=int, default=10, help="Save progress to --out every N scraped rows (default: 10)")
     args = ap.parse_args()
-    
+
     if args.sku_col and not args.input_file:
         print("❌ Error: --sku-col requires --in")
         return
@@ -840,120 +929,177 @@ def main():
     if not args.url and not args.search_url and not args.input_file and not args.sku:
         print("❌ Error: Must provide one of --url, --search-url, --in, or --sku")
         return
-    
+
     # Create output directory if needed
     output_dir = os.path.dirname(args.output_file)
     if output_dir and not os.path.exists(output_dir):
         os.makedirs(output_dir)
 
-    # Resume logic: load existing output and collect already-done QuerySKUs
-    existing_df = None
-    already_done_skus: set = set()
-    if os.path.exists(args.output_file):
-        try:
-            existing_df = pd.read_excel(args.output_file)
-            if "QuerySKU" in existing_df.columns and "Found" in existing_df.columns:
-                already_done_skus = set(
-                    existing_df.loc[existing_df["Found"] == True, "QuerySKU"].astype(str).str.strip()
-                )
-            elif "QuerySKU" in existing_df.columns:
-                # fallback: use status-like column if present
-                pass
-            print(f"Resuming: {len(already_done_skus)} SKUs already done, will skip them")
-        except Exception as e:
-            print(f"Warning: could not read existing output ({e}), starting fresh")
-            existing_df = None
-
-    # Build driver
     driver = build_driver(headless=args.headless)
     wait = WebDriverWait(driver, 20)
-    
+
     try:
         print("Bashiti Hardware Scraper")
         print(f"Output: {args.output_file}")
         print(f"Pause: {args.pause}s")
         print()
-        
-        sku_mode = bool(args.sku or args.sku_col)
-        product_urls: List[str] = []
-        sku_list: List[str] = []
 
-        if sku_mode:
-            if args.sku:
-                sku_list = [args.sku.strip()]
-            else:
-                try:
-                    sku_list = _load_skus_from_excel(args.input_file, args.sku_col)
-                except ValueError as e:
-                    print(f"❌ {e}")
-                    return
-                except Exception as e:
-                    print(f"❌ Error reading Excel: {e}")
-                    return
-            print("SKU search template: https://bashitihardware.com/?s=<SKU>&post_type=product")
-            # Apply test slicing
-            start = max(0, int(args.start or 0))
-            if start:
-                sku_list = sku_list[start:]
-            if args.limit and int(args.limit) > 0:
-                sku_list = sku_list[: int(args.limit)]
-            print(f"Loaded {len(sku_list)} SKU(s) to resolve")
-        elif args.url:
-            # Single URL
-            product_urls = [args.url]
-            print(f"Scraping single URL: {args.url}")
-            
-        elif args.search_url:
-            # Search/category URL - extract all product links
-            print(f"Extracting products from: {args.search_url}")
-            product_urls = extract_all_product_links(driver, args.search_url, wait)
-            print(f"Found {len(product_urls)} products to scrape")
-            
-        elif args.input_file:
-            # Excel file with URLs
+        # -----------------------------------------------------------------
+        # MODE 1: --in file provided (with or without --sku-col).
+        # The original sheet (all its existing columns) is kept exactly as
+        # it is; we only APPEND/UPDATE the scraped columns on top of it.
+        # -----------------------------------------------------------------
+        if args.input_file:
             try:
-                df = pd.read_excel(args.input_file)
-                print(f"Loaded {len(df)} rows from {args.input_file}")
-                
-                # Find URL column
-                if args.url_col:
-                    if args.url_col in df.columns:
-                        url_col = args.url_col
-                    else:
-                        print(f"❌ Column '{args.url_col}' not found. Available: {list(df.columns)}")
-                        return
-                else:
-                    # Auto-detect
-                    for c in df.columns:
-                        if "url" in str(c).lower():
-                            url_col = c
-                            break
-                    else:
-                        url_col = df.columns[0]
-                
-                print(f"Using URL column: '{url_col}'")
-                product_urls = [str(url).strip() for url in df[url_col] if pd.notna(url) and str(url).strip().startswith("http")]
-                
+                df_in = pd.read_excel(args.input_file)
             except Exception as e:
                 print(f"❌ Error reading input file: {e}")
                 return
-        
-        if sku_mode:
-            if not sku_list:
-                print("❌ No SKUs to process")
+            print(f"Loaded {len(df_in)} rows from {args.input_file} (columns kept as-is: {list(df_in.columns)})")
+
+            cols = ScrapeColumns(list(df_in.columns))
+            out_df = _load_resumable_df(args.output_file, df_in, cols)
+
+            if args.sku_col:
+                if args.sku_col not in df_in.columns:
+                    print(f"❌ Column '{args.sku_col}' not found. Available: {list(df_in.columns)}")
+                    return
+                query_col = args.sku_col
+                print("SKU search template: https://bashitihardware.com/?s=<SKU>&post_type=product")
+                query_kind = "sku"
+            else:
+                if args.url_col:
+                    if args.url_col not in df_in.columns:
+                        print(f"❌ Column '{args.url_col}' not found. Available: {list(df_in.columns)}")
+                        return
+                    query_col = args.url_col
+                else:
+                    query_col = None
+                    for c in df_in.columns:
+                        if "url" in str(c).lower():
+                            query_col = c
+                            break
+                    if query_col is None:
+                        query_col = df_in.columns[0]
+                print(f"Using URL column: '{query_col}'")
+                query_kind = "url"
+
+            # Build (row_index, query_value) pairs in original row order.
+            rows: List[Any] = []
+            for idx, val in df_in[query_col].items():
+                if pd.isna(val):
+                    continue
+                sval = str(val).strip()
+                if not sval or sval.lower() == "nan":
+                    continue
+                if query_kind == "url" and not sval.startswith("http"):
+                    continue
+                rows.append((idx, sval))
+
+            if not rows:
+                print(f"❌ No usable values found in column '{query_col}'")
                 return
-        elif not product_urls:
-            print("❌ No product URLs to scrape")
-            if args.input_file and not args.sku_col:
-                print(
-                    "   Hint: URL mode only keeps rows whose cell starts with http:// or https:// . "
-                    'If your sheet has SKUs (e.g. column "Item No."), run with '
-                    '--sku-col "Item No." (or your exact header) to search then scrape.'
-                )
+
+            # Apply test slicing (--start/--limit) to the *rows to process this run*.
+            start = max(0, int(args.start or 0))
+            if start:
+                rows = rows[start:]
+            if args.limit and int(args.limit) > 0:
+                rows = rows[: int(args.limit)]
+
+            total = len(rows)
+            print(f"{total} row(s) to process this run")
+
+            cache: Dict[str, Dict[str, Any]] = {}
+            processed = 0
+            found_count = 0
+
+            for i, (idx, qval) in enumerate(rows, 1):
+                already_found = bool(out_df.at[idx, cols.found]) if cols.found in out_df.columns else False
+                if already_found:
+                    print(f"\n[{i}/{total}] Row {idx}: already done, skipping ({qval})")
+                    found_count += 1
+                    continue
+
+                print(f"\n[{i}/{total}] Row {idx} — {'SKU' if query_kind == 'sku' else 'URL'}: {qval}")
+                try:
+                    if qval in cache:
+                        result = cache[qval]
+                        print("    → Reusing result from an earlier identical row")
+                    elif query_kind == "sku":
+                        result = scrape_from_sku_search(driver, qval, wait, args.pause, args.max_img)
+                        cache[qval] = result
+                    else:
+                        result = scrape_product(driver, qval, wait, args.pause, args.max_img)
+                        cache[qval] = result
+
+                    _write_result_into_row(out_df, idx, cols, result)
+
+                    status = "FOUND" if result.get("Found") else "NOT FOUND"
+                    title = result.get("Title", "")
+                    price = result.get("Price", "")
+                    desc_len = len(result.get("Description", "") or "")
+                    img_count = len(result.get("Images", []) or [])
+                    print(
+                        f"    → {status} | Title: {title[:40]}... | "
+                        f"Price: {price} | Desc: {desc_len} chars | Images: {img_count}"
+                    )
+                    if result.get("Found"):
+                        found_count += 1
+                except Exception as e:
+                    print(f"    → ERROR: {e}")
+                    error_result = {
+                        "ProductURL": qval if query_kind == "url" else "",
+                        "SearchURL": SKU_SEARCH_URL_TEMPLATE.format(quote_plus(qval)) if query_kind == "sku" else "",
+                        "Title": "", "SKU": "", "Price": "", "Description": "",
+                        "Images": [], "Found": False, "Note": f"Error: {e}",
+                    }
+                    _write_result_into_row(out_df, idx, cols, error_result)
+
+                processed += 1
+                if args.save_every and processed % args.save_every == 0:
+                    out_df.to_excel(args.output_file, index=False)
+                    print(f"    (progress saved: {processed}/{total})")
+
+                time.sleep(args.pause)
+
+            out_df.to_excel(args.output_file, index=False)
+
+            print("\nScraping Complete!")
+            print(f"   Total rows processed this run: {total}")
+            print(f"   Found (all-time, this sheet): {found_count}")
+            if total:
+                print(f"   Success Rate (this run): {found_count/total*100:.1f}%")
+            print(f"   Results saved to: {args.output_file}")
             return
-        
-        if not sku_mode:
-            # Deduplicate product URLs before scraping
+
+        # -----------------------------------------------------------------
+        # MODE 2: no --in given (--url single product, or --search-url a
+        # listing/category page, or --sku a single ad-hoc SKU). There is no
+        # original sheet to preserve here, so we just produce a results
+        # sheet, appending to any previous run of --out as before.
+        # -----------------------------------------------------------------
+        existing_df = None
+        if os.path.exists(args.output_file):
+            try:
+                existing_df = pd.read_excel(args.output_file)
+            except Exception as e:
+                print(f"Warning: could not read existing output ({e}), starting fresh")
+                existing_df = None
+
+        product_urls: List[str] = []
+        sku_single: Optional[str] = None
+
+        if args.sku:
+            sku_single = args.sku.strip()
+            print("SKU search template: https://bashitihardware.com/?s=<SKU>&post_type=product")
+        elif args.url:
+            product_urls = [args.url]
+            print(f"Scraping single URL: {args.url}")
+        elif args.search_url:
+            print(f"Extracting products from: {args.search_url}")
+            product_urls = extract_all_product_links(driver, args.search_url, wait)
+            print(f"Found {len(product_urls)} products to scrape")
             seen_urls = set()
             unique_product_urls = []
             for url in product_urls:
@@ -964,53 +1110,23 @@ def main():
             if len(product_urls) != len(unique_product_urls):
                 print(f"Deduplicated: {len(product_urls)} -> {len(unique_product_urls)} unique products")
             product_urls = unique_product_urls
-            # Apply test slicing
             start = max(0, int(args.start or 0))
             if start:
                 product_urls = product_urls[start:]
             if args.limit and int(args.limit) > 0:
                 product_urls = product_urls[: int(args.limit)]
-        
-        results: List[Dict[str, Any]] = []
-        total = len(sku_list) if sku_mode else len(product_urls)
 
-        if sku_mode:
-            for idx, qsku in enumerate(sku_list, 1):
-                if str(qsku).strip() in already_done_skus:
-                    print(f"\n[{idx}/{total}] Skipping already-done SKU: {qsku}")
-                    continue
-                print(f"\n[{idx}/{total}] SKU: {qsku}")
-                try:
-                    result = scrape_from_sku_search(driver, qsku, wait, args.pause, args.max_img)
-                    results.append(result)
-                    status = "FOUND" if result.get("Found") else "NOT FOUND"
-                    title = result.get("Title", "")
-                    psku = result.get("SKU", "")
-                    desc_len = len(result.get("Description", ""))
-                    img_count = len(result.get("Images", []))
-                    price = result.get("Price", "")
-                    print(
-                        f"    → {status} | Title: {title[:40]}... | SKU: {psku} | "
-                        f"Price: {price} | Desc: {desc_len} chars | Images: {img_count}"
-                    )
-                except Exception as e:
-                    print(f"    → ERROR: {e}")
-                    results.append(
-                        {
-                            "QuerySKU": qsku,
-                            "SearchURL": SKU_SEARCH_URL_TEMPLATE.format(quote_plus(qsku.strip())),
-                            "ProductURL": "",
-                            "Title": "",
-                            "SKU": "",
-                            "Price": "",
-                            "Description": "",
-                            "Images": [],
-                            "Found": False,
-                            "Note": f"Error: {e}",
-                        }
-                    )
-                time.sleep(args.pause)
+        if not sku_single and not product_urls:
+            print("❌ No products to scrape")
+            return
+
+        results: List[Dict[str, Any]] = []
+
+        if sku_single:
+            result = scrape_from_sku_search(driver, sku_single, wait, args.pause, args.max_img)
+            results.append(result)
         else:
+            total = len(product_urls)
             for idx, product_url in enumerate(product_urls, 1):
                 print(f"\n[{idx}/{total}] Processing: {product_url}")
                 try:
@@ -1018,44 +1134,23 @@ def main():
                     result["QuerySKU"] = ""
                     result["SearchURL"] = ""
                     results.append(result)
-                    status = "FOUND" if result.get("Found") else "NOT FOUND"
-                    title = result.get("Title", "")
-                    sku = result.get("SKU", "")
-                    desc_len = len(result.get("Description", ""))
-                    img_count = len(result.get("Images", []))
-                    price = result.get("Price", "")
-                    print(
-                        f"    → {status} | Title: {title[:40]}... | SKU: {sku} | "
-                        f"Price: {price} | Desc: {desc_len} chars | Images: {img_count}"
-                    )
                 except Exception as e:
                     print(f"    → ERROR: {e}")
                     results.append(
                         {
-                            "QuerySKU": "",
-                            "SearchURL": "",
-                            "ProductURL": product_url,
-                            "Title": "",
-                            "SKU": "",
-                            "Price": "",
-                            "Description": "",
-                            "Images": [],
-                            "Found": False,
-                            "Note": f"Error: {e}",
+                            "QuerySKU": "", "SearchURL": "", "ProductURL": product_url,
+                            "Title": "", "SKU": "", "Price": "", "Description": "",
+                            "Images": [], "Found": False, "Note": f"Error: {e}",
                         }
                     )
                 time.sleep(args.pause)
-        
-        # Create results DataFrame
-        new_results_df = pd.DataFrame(results)
 
-        # Convert Images list to semicolon-separated string
+        new_results_df = pd.DataFrame(results)
         if len(new_results_df) > 0:
             new_results_df["Images"] = new_results_df["Images"].apply(
                 lambda lst: ";".join(lst) if isinstance(lst, list) and lst else ""
             )
 
-        # Save results (append to existing)
         if existing_df is not None and len(new_results_df) > 0:
             final_df = pd.concat([existing_df, new_results_df], ignore_index=True)
         elif existing_df is not None:
@@ -1063,19 +1158,18 @@ def main():
         else:
             final_df = new_results_df
         final_df.to_excel(args.output_file, index=False)
-        
-        # Print summary
+
         found_count = sum(1 for result in results if result.get("Found", False))
         print("\nScraping Complete!")
-        print(f"   Total products: {total}")
+        print(f"   Total products: {len(results)}")
         print(f"   Found: {found_count}")
-        print(f"   Success Rate: {found_count/total*100:.1f}%")
+        if results:
+            print(f"   Success Rate: {found_count/len(results)*100:.1f}%")
         print(f"   Results saved to: {args.output_file}")
-    
+
     finally:
         driver.quit()
 
 
 if __name__ == "__main__":
     main()
-
